@@ -99,10 +99,7 @@ def parse_rss_entries(xml_bytes: bytes) -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
     root = ET.fromstring(xml_bytes)
 
-    raw_items = []
-    for elem in root.iter():
-        if _local_name(elem.tag) in ("item", "entry"):
-            raw_items.append(elem)
+    raw_items = [elem for elem in root.iter() if _local_name(elem.tag) in ("item", "entry")]
 
     for node in raw_items:
         title = ""
@@ -183,7 +180,7 @@ def fetch_news_items(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
                 feed_url,
                 headers={"User-Agent": "Mozilla/5.0 (BrahminsTV-BulletinBuilder/1.0)"},
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 xml_data = resp.read()
             for entry in parse_rss_entries(xml_data):
                 if len(items) >= limit:
@@ -199,7 +196,7 @@ def fetch_news_items(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
                 summary = clean_display_text(entry.get("summary", title))
                 items.append({
                     "title": title,
-                    "summary": summary[:240],
+                    "summary": summary[:220],
                     "image_url": (entry.get("image_url") or "").strip(),
                 })
         except Exception:
@@ -225,7 +222,7 @@ def load_story_photo(image_url: str, fallback_template: Image.Image) -> Image.Im
                 image_url,
                 headers={"User-Agent": "Mozilla/5.0 (BrahminsTV-BulletinBuilder/1.0)"},
             )
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=6) as resp:
                 data = resp.read()
             img = Image.open(io.BytesIO(data)).convert("RGB")
             if img.width >= 200 and img.height >= 120:
@@ -241,7 +238,7 @@ def fit_cover(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
     scale = max(box_w / src_w, box_h / src_h)
     nw = max(1, int(round(src_w * scale)))
     nh = max(1, int(round(src_h * scale)))
-    return img.convert("RGB").resize((nw, nh), Image.Resampling.LANCZOS)
+    return img.convert("RGB").resize((nw, nh), Image.Resampling.BICUBIC)
 
 
 def wrap_lines_clean(
@@ -272,40 +269,15 @@ def wrap_lines_clean(
     return lines
 
 
-def render_frame(
-    base_template: Image.Image,
-    photo_rgb: Image.Image,
-    headline: str,
-    progress: float,
-) -> Image.Image:
-    t = max(0.0, min(1.0, progress))
-    ease = 0.5 - 0.5 * math.cos(math.pi * t)
-
-    frame = base_template.copy()
-
-    # 1. Upper Photo Slot: smooth zoom (1.00x -> 1.07x) & gentle pan, no extra logo
-    px1, py1, px2, py2 = SLOT_PHOTO
-    pw, ph = px2 - px1, py2 - py1
-    base_photo = fit_cover(photo_rgb, pw, ph)
-    zoom = 1.0 + 0.07 * ease
-    zw = max(pw, int(round(base_photo.width * zoom)))
-    zh = max(ph, int(round(base_photo.height * zoom)))
-    zoomed = base_photo.resize((zw, zh), Image.Resampling.LANCZOS)
-
-    max_dx = max(0, zw - pw)
-    max_dy = max(0, zh - ph)
-    crop_x = int(round(max_dx * 0.5 * ease))
-    crop_y = int(round(max_dy * 0.5 * (1.0 - ease)))
-    crop_box = zoomed.crop((crop_x, crop_y, crop_x + pw, crop_y + ph)).convert("RGBA")
-    frame.paste(crop_box, (px1, py1))
-
-    # 2. Lower Breaking News Slot: clean headline inside lower box only
+def build_static_text_layer(base_template: Image.Image, headline: str) -> Image.Image:
+    """Draws the lower breaking news text once per story onto a copy of the studio template."""
+    layer = base_template.copy()
     nx1, ny1, nx2, ny2 = SLOT_NEWS
     pad_x, pad_y = 32, 24
     inner_w = (nx2 - nx1) - pad_x * 2
     inner_h = (ny2 - ny1) - pad_y * 2
 
-    draw = ImageDraw.Draw(frame)
+    draw = ImageDraw.Draw(layer)
     headline_clean = clean_display_text(headline)
 
     chosen_size = 44
@@ -334,7 +306,35 @@ def render_frame(
         draw.text((lx + 2, ly + 2), line, font=chosen_font, fill=(0, 0, 0, 230))
         draw.text((lx, ly), line, font=chosen_font, fill=(255, 255, 255, 255))
 
-    return frame.convert("RGB")
+    return layer
+
+
+def render_frame_fast(
+    text_layer: Image.Image,
+    base_photo: Image.Image,
+    progress: float,
+) -> bytes:
+    """Renders one 1080x1920 RGB frame in memory and returns raw bytes for FFmpeg stdin."""
+    t = max(0.0, min(1.0, progress))
+    ease = 0.5 - 0.5 * math.cos(math.pi * t)
+
+    frame = text_layer.copy()
+
+    px1, py1, px2, py2 = SLOT_PHOTO
+    pw, ph = px2 - px1, py2 - py1
+    zoom = 1.0 + 0.07 * ease
+    zw = max(pw, int(round(base_photo.width * zoom)))
+    zh = max(ph, int(round(base_photo.height * zoom)))
+    zoomed = base_photo.resize((zw, zh), Image.Resampling.BILINEAR)
+
+    max_dx = max(0, zw - pw)
+    max_dy = max(0, zh - ph)
+    crop_x = int(round(max_dx * 0.5 * ease))
+    crop_y = int(round(max_dy * 0.5 * (1.0 - ease)))
+    crop_box = zoomed.crop((crop_x, crop_y, crop_x + pw, crop_y + ph)).convert("RGBA")
+    frame.paste(crop_box, (px1, py1))
+
+    return frame.convert("RGB").tobytes()
 
 
 def probe_duration_seconds(media_path: str) -> float:
@@ -385,26 +385,27 @@ def build_segment_video(
 ) -> str:
     audio_path = os.path.join(workdir, f"seg_{idx:02d}.mp3")
     seg_mp4 = os.path.join(workdir, f"seg_{idx:02d}.mp4")
-    frames_dir = os.path.join(workdir, f"frames_{idx:02d}")
-    os.makedirs(frames_dir, exist_ok=True)
 
     audio_dur = synthesize_voiceover(spoken_text, audio_path)
     total_dur = audio_dur + 0.35
     num_frames = max(12, int(math.ceil(total_dur * FPS)))
 
-    for f_idx in range(num_frames):
-        progress = f_idx / max(1, num_frames - 1)
-        frame = render_frame(base_template, photo_rgb, headline, progress)
-        frame.save(os.path.join(frames_dir, f"f_{f_idx:04d}.png"), format="PNG", compress_level=1)
+    px1, py1, px2, py2 = SLOT_PHOTO
+    base_photo = fit_cover(photo_rgb, px2 - px1, py2 - py1)
+    text_layer = build_static_text_layer(base_template, headline)
 
-    subprocess.run(
+    proc = subprocess.Popen(
         [
             "ffmpeg", "-y",
-            "-framerate", str(FPS),
-            "-i", os.path.join(frames_dir, "f_%04d.png"),
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{W}x{H}",
+            "-pix_fmt", "rgb24",
+            "-r", str(FPS),
+            "-i", "-",
             "-i", audio_path,
             "-c:v", "libx264",
-            "-preset", "veryfast",
+            "-preset", "ultrafast",
             "-crf", "23",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
@@ -412,10 +413,22 @@ def build_segment_video(
             "-shortest",
             seg_mp4,
         ],
+        stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        check=True,
     )
+
+    assert proc.stdin is not None
+    try:
+        for f_idx in range(num_frames):
+            progress = f_idx / max(1, num_frames - 1)
+            proc.stdin.write(render_frame_fast(text_layer, base_photo, progress))
+    finally:
+        proc.stdin.close()
+        ret = proc.wait()
+        if ret != 0:
+            raise RuntimeError(f"FFmpeg failed on segment {idx} with code {ret}")
+
     return seg_mp4
 
 
@@ -431,12 +444,7 @@ def concat_segments(segment_paths: List[str], out_mp4: str, workdir: str) -> Non
             "-f", "concat",
             "-safe", "0",
             "-i", list_file,
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "22",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "128k",
+            "-c", "copy",
             "-movflags", "+faststart",
             out_mp4,
         ],
