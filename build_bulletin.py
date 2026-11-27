@@ -15,7 +15,7 @@ import re
 import subprocess
 import tempfile
 import urllib.request
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import feedparser
 from PIL import Image, ImageDraw, ImageFont
@@ -70,7 +70,8 @@ def clean_for_tts(text: str) -> str:
     """
     Ensures clear Indian English pronunciation:
       - Brahmins / Brahmans -> Brah-mins
-      - TV -> Brah-mins T V (when standalone) or T V
+      - Brah-mins TV -> Brah-mins T V
+      - TV -> T V
       - JEE Main -> J E E Main
       - N bhp -> N brake horsepower
     """
@@ -89,7 +90,6 @@ def fetch_news_items(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
     items: List[Dict[str, str]] = []
     seen_titles = set()
 
-    # Optional CSV/JSON input if provided via environment
     items_file = os.environ.get("NEWS_ITEMS_FILE", "").strip()
     if items_file and os.path.exists(items_file):
         with open(items_file, "r", encoding="utf-8") as f:
@@ -168,7 +168,6 @@ def fetch_news_items(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
 
 def load_story_photo(image_url: str, fallback_template: Image.Image) -> Image.Image:
     px1, py1, px2, py2 = SLOT_PHOTO
-    pw, ph = px2 - px1, py2 - py1
 
     if image_url:
         try:
@@ -184,7 +183,6 @@ def load_story_photo(image_url: str, fallback_template: Image.Image) -> Image.Im
         except Exception:
             pass
 
-    # Fallback: crop clean studio art from template without extra logos
     return fallback_template.crop((px1, py1, px2, py2)).convert("RGB")
 
 
@@ -196,7 +194,13 @@ def fit_cover(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
     return img.convert("RGB").resize((nw, nh), Image.Resampling.LANCZOS)
 
 
-def wrap_lines_clean(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_w: int, max_lines: int = 4) -> List[str]:
+def wrap_lines_clean(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    max_w: int,
+    max_lines: int = 4,
+) -> List[str]:
     words = text.strip().split()
     if not words:
         return []
@@ -224,17 +228,12 @@ def render_frame(
     headline: str,
     progress: float,
 ) -> Image.Image:
-    """
-    Renders one 1080x1920 frame using the fixed studio template and updating ONLY:
-      1) Upper photo slot (smooth ease-in-out zoom + pan, no extra logo overlay)
-      2) Lower breaking news slot (clean centered headline text)
-    """
     t = max(0.0, min(1.0, progress))
     ease = 0.5 - 0.5 * math.cos(math.pi * t)
 
     frame = base_template.copy()
 
-    # 1. Upper Photo Slot: smooth zoom (1.00x -> 1.07x) & gentle pan
+    # 1. Upper Photo Slot: smooth zoom (1.00x -> 1.07x) & gentle pan, no extra logo
     px1, py1, px2, py2 = SLOT_PHOTO
     pw, ph = px2 - px1, py2 - py1
     base_photo = fit_cover(photo_rgb, pw, ph)
@@ -288,35 +287,6 @@ def render_frame(
     return frame.convert("RGB")
 
 
-def synthesize_voiceover(spoken_text: str, out_mp3: str) -> float:
-    """
-    Generates spoken audio via gTTS with fallback to silent WAV if network TTS is unavailable.
-    Returns exact audio duration in seconds so video frames match audio length without clipping.
-    """
-    try:
-        from gtts import gTTS
-        tts = gTTS(text=spoken_text, lang="en", tld="co.in", slow=False)
-        tts.save(out_mp3)
-        dur = probe_duration_seconds(out_mp3)
-        if dur > 0.5:
-            return dur
-    except Exception:
-        pass
-
-    # Fallback: ~14 characters per second reading pace
-    est_sec = max(2.5, min(8.0, len(spoken_text) / 14.0))
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
-            "-t", f"{est_sec:.2f}", "-q:a", "9", out_mp3,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True,
-    )
-    return est_sec
-
-
 def probe_duration_seconds(media_path: str) -> float:
     try:
         out = subprocess.check_output(
@@ -329,6 +299,30 @@ def probe_duration_seconds(media_path: str) -> float:
         return float(out)
     except Exception:
         return 0.0
+
+
+def synthesize_voiceover(spoken_text: str, out_mp3: str) -> float:
+    try:
+        from gtts import gTTS
+        tts = gTTS(text=spoken_text, lang="en", tld="co.in", slow=False)
+        tts.save(out_mp3)
+        dur = probe_duration_seconds(out_mp3)
+        if dur > 0.5:
+            return dur
+    except Exception:
+        pass
+
+    est_sec = max(2.5, min(8.0, len(spoken_text) / 14.0))
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+            "-t", f"{est_sec:.2f}", "-q:a", "9", out_mp3,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
+    return est_sec
 
 
 def build_segment_video(
@@ -345,7 +339,6 @@ def build_segment_video(
     os.makedirs(frames_dir, exist_ok=True)
 
     audio_dur = synthesize_voiceover(spoken_text, audio_path)
-    # Add 0.35s tail buffer so final syllables never cut off abruptly
     total_dur = audio_dur + 0.35
     num_frames = max(12, int(math.ceil(total_dur * FPS)))
 
@@ -415,7 +408,6 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         segments: List[str] = []
 
-        # 0th-second opening hook segment using first story visual + punchy hook narration
         first_item = items[0]
         first_photo = load_story_photo(first_item["image_url"], base_template)
         hook_spoken = clean_for_tts(
@@ -432,7 +424,6 @@ def main() -> None:
             )
         )
 
-        # Remaining items up to MAX_ITEMS while keeping total runtime under TARGET_MAX_SECONDS
         running_sec = probe_duration_seconds(segments[0])
         for i, item in enumerate(items[1:], start=1):
             if running_sec >= TARGET_MAX_SECONDS - 4.0:
