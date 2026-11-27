@@ -3,8 +3,12 @@ name: Build and Publish Top 25 Bulletin
 on:
   workflow_dispatch:
   schedule:
-    # 7:00 AM, 12:00 PM, 5:00 PM, 10:00 PM IST
-    - cron: '30 1,6,11,16 * * *'
+    # Runs at 7:00 AM, 12:00 PM, 5:00 PM, and 10:00 PM IST
+    # (01:30, 06:30, 11:30, and 16:30 UTC)
+    - cron: "30 1 * * *"
+    - cron: "30 6 * * *"
+    - cron: "30 11 * * *"
+    - cron: "30 16 * * *"
 
 permissions:
   contents: write
@@ -12,6 +16,7 @@ permissions:
 jobs:
   build-bulletin:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -19,21 +24,28 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install FFmpeg and Python dependencies
+      - name: Install FFmpeg, fonts, and Python packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core
-          pip install requests edge-tts
+          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-liberation
+          pip install --upgrade pip
+          pip install requests edge-tts pillow numpy
 
-      - name: Generate Top 25 vertical video
+      - name: Build 9:16 Top 25 news bulletin
         env:
           NEWS_FEED_URL: ${{ secrets.NEWS_FEED_URL }}
         run: python build_bulletin.py
 
-      - name: Upload video to GitHub Release
+      - name: Publish to GitHub Release (latest-bulletin)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload latest-bulletin top25-latest.mp4 --clobber
+          gh release create latest-bulletin top25-latest.mp4 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Latest Top 25 Bulletin" \
+            --notes "Automated 9:16 Brahmins TV Top 25 News Shots bulletin." \
+            || gh release upload latest-bulletin top25-latest.mp4 \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
