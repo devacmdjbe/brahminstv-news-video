@@ -15,9 +15,9 @@ import re
 import subprocess
 import tempfile
 import urllib.request
+import xml.etree.ElementTree as ET
 from typing import Dict, List, Tuple
 
-import feedparser
 from PIL import Image, ImageDraw, ImageFont
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,12 @@ def load_font(size: int) -> ImageFont.FreeTypeFont:
 
 def clean_display_text(text: str) -> str:
     text = re.sub(r"<[^>]+>", " ", text or "")
-    text = text.replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
+    text = (
+        text.replace("&amp;", "&")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+    )
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -84,6 +89,57 @@ def clean_for_tts(text: str) -> str:
     s = re.sub(r"\b(\d+(?:\.\d+)?)\s*bhp\b", r"\1 brake horsepower", s, flags=re.IGNORECASE)
     s = re.sub(r"\bIST\b", "I S T", s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+def _local_name(tag: str) -> str:
+    return tag.split("}", 1)[-1].lower() if tag else ""
+
+
+def parse_rss_entries(xml_bytes: bytes) -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
+    root = ET.fromstring(xml_bytes)
+
+    raw_items = []
+    for elem in root.iter():
+        if _local_name(elem.tag) in ("item", "entry"):
+            raw_items.append(elem)
+
+    for node in raw_items:
+        title = ""
+        summary = ""
+        image_url = ""
+
+        for child in node:
+            cname = _local_name(child.tag)
+            if cname == "title" and not title:
+                title = "".join(child.itertext())
+            elif cname in ("description", "summary", "encoded") and not summary:
+                summary = "".join(child.itertext())
+            elif cname in ("content", "thumbnail", "enclosure"):
+                url_attr = child.attrib.get("url") or child.attrib.get("href") or ""
+                mime = (child.attrib.get("type") or "").lower()
+                if url_attr and (
+                    cname == "thumbnail"
+                    or "image" in mime
+                    or re.search(r"\.(jpg|jpeg|png|webp)", url_attr.lower())
+                ):
+                    if not image_url:
+                        image_url = url_attr
+            elif cname == "link":
+                href = child.attrib.get("href") or ""
+                rel = (child.attrib.get("rel") or "").lower()
+                mime = (child.attrib.get("type") or "").lower()
+                if href and not image_url and (rel == "enclosure" or "image" in mime):
+                    image_url = href
+
+        if title:
+            entries.append({
+                "title": title,
+                "summary": summary or title,
+                "image_url": image_url,
+            })
+
+    return entries
 
 
 def fetch_news_items(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
@@ -123,8 +179,13 @@ def fetch_news_items(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
         if len(items) >= limit:
             break
         try:
-            parsed = feedparser.parse(feed_url)
-            for entry in parsed.entries:
+            req = urllib.request.Request(
+                feed_url,
+                headers={"User-Agent": "Mozilla/5.0 (BrahminsTV-BulletinBuilder/1.0)"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                xml_data = resp.read()
+            for entry in parse_rss_entries(xml_data):
                 if len(items) >= limit:
                     break
                 title = clean_display_text(entry.get("title", ""))
@@ -136,21 +197,10 @@ def fetch_news_items(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
                 seen_titles.add(key)
 
                 summary = clean_display_text(entry.get("summary", title))
-                image_url = ""
-                if entry.get("media_content"):
-                    image_url = entry["media_content"][0].get("url", "")
-                elif entry.get("media_thumbnail"):
-                    image_url = entry["media_thumbnail"][0].get("url", "")
-                elif entry.get("links"):
-                    for lk in entry["links"]:
-                        if lk.get("type", "").startswith("image/"):
-                            image_url = lk.get("href", "")
-                            break
-
                 items.append({
                     "title": title,
                     "summary": summary[:240],
-                    "image_url": image_url,
+                    "image_url": (entry.get("image_url") or "").strip(),
                 })
         except Exception:
             continue
