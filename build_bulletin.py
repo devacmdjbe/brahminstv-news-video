@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
 Brahmins TV - Top 25 News Shots Vertical (9:16) Bulletin Builder
-Guaranteed fixes:
-  1. Images: Extracts image URLs from RSS media tags, enclosures, AND HTML <img> tags inside description/content;
-     generates a clean, branded dynamic news visual card if a story has no valid web image (never blank).
-  2. Audio: Uses reliable gTTS + offline espeak-ng fallback (installed in workflow) so every segment ALWAYS
-     has spoken Indian-English audio with "Brah-mins Television / T V" pronunciation (never silent).
-  3. Smooth Animation: Per-frame smooth Ken Burns zoom/pan + horizontal breaking-news ticker/entrance slide.
+Selects stories from Brahmins TV's own Top 50 / Archive (local files or Apps Script JSON)
+instead of external RSS feeds, filtered by bulletin time window & viral/breaking priority,
+with brisk multi-voice rotation (3 female + 2 male) and expanded spoken text.
 """
 
 import csv
+import datetime as dt
 import io
 import json
 import math
@@ -17,9 +15,9 @@ import os
 import re
 import subprocess
 import tempfile
+import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -39,14 +37,60 @@ TEMPLATE_PATH = os.environ.get("STUDIO_TEMPLATE_PATH", "assets/studio_template_9
 SLOT_PHOTO: Tuple[int, int, int, int] = (36, 418, 1044, 1110)
 SLOT_NEWS: Tuple[int, int, int, int] = (44, 1272, 1036, 1608)
 
-DEFAULT_FEEDS = [
-    "https://www.thehindu.com/news/national/feeder/default.rss",
-    "https://www.thehindu.com/news/national/tamil-nadu/feeder/default.rss",
-    "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
-    "https://www.indiatoday.in/rss/1206578",
-    "https://feeds.feedburner.com/ndtvnews-top-stories",
-    "https://www.news18.com/rss/india.xml",
+# Candidate local files for Top 50 / Archive (checked in priority order)
+LOCAL_SOURCE_CANDIDATES = [
+    "top50.json",
+    "top50.csv",
+    "archive.json",
+    "archive.csv",
+    "data/top50.json",
+    "data/top50.csv",
+    "data/archive.json",
+    "data/archive.csv",
 ]
+
+# 3 Female + 2 Male brisk voice profiles (tempo & pitch shifts applied cleanly in FFmpeg)
+VOICE_ROSTER: List[Dict[str, Any]] = [
+    {"name": "female_1", "gender": "F", "tempo": 1.14, "pitch_semitones": 1.2, "espeak": "en-in+f3", "speed": 176},
+    {"name": "male_1",   "gender": "M", "tempo": 1.15, "pitch_semitones": -1.5, "espeak": "en-in+m2", "speed": 178},
+    {"name": "female_2", "gender": "F", "tempo": 1.16, "pitch_semitones": 2.0, "espeak": "en-in+f4", "speed": 180},
+    {"name": "male_2",   "gender": "M", "tempo": 1.14, "pitch_semitones": -2.2, "espeak": "en-in+m3", "speed": 176},
+    {"name": "female_3", "gender": "F", "tempo": 1.15, "pitch_semitones": 0.6, "espeak": "en-in+f2", "speed": 178},
+]
+
+VIRAL_KEYWORDS = [
+    "breaking", "shocking", "viral", "alert", "massive", "huge", "major",
+    "row", "clash", "probe", "arrest", "scam", "crisis", "warning", "surge",
+    "ban", "verdict", "resigns", "sacked", "live", "urgent", "blast", "flood",
+]
+
+ABBREVIATION_MAP: Dict[str, str] = {
+    "TV": "Television",
+    "HC": "High Court",
+    "SC": "Supreme Court",
+    "CBI": "Central Bureau of Investigation",
+    "ED": "Enforcement Directorate",
+    "SBI": "State Bank of India",
+    "RBI": "Reserve Bank of India",
+    "AP": "Andhra Pradesh",
+    "TN": "Tamil Nadu",
+    "TS": "Telangana",
+    "UP": "Uttar Pradesh",
+    "MP": "Madhya Pradesh",
+    "BJP": "Bharatiya Janata Party",
+    "INC": "Congress",
+    "DMK": "Dravida Munnetra Kazhagam",
+    "AIADMK": "All India Anna Dravida Munnetra Kazhagam",
+    "PM": "Prime Minister",
+    "CM": "Chief Minister",
+    "MLA": "Member of Legislative Assembly",
+    "MPs": "Members of Parliament",
+    "FIR": "First Information Report",
+    "CCTV": "closed circuit camera",
+    "AI": "Artificial Intelligence",
+    "IST": "Indian Standard Time",
+    "M/s": "Messers",
+}
 
 FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -62,239 +106,339 @@ def load_font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
-def clean_display_text(text: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", text or "")
-    text = (
-        text.replace("&amp;", "&")
+def clean_display_text(text: Any) -> str:
+    s = str(text or "")
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = (
+        s.replace("&amp;", "&")
         .replace("&quot;", '"')
         .replace("&#39;", "'")
         .replace("&apos;", "'")
         .replace("&nbsp;", " ")
     )
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def clean_for_tts(text: str) -> str:
-    """
-    Ensures clear Indian English pronunciation:
-      - Brahmins / Brahmans -> Brah-mins
-      - Brah-mins TV -> Brah-mins T V
-      - TV -> T V
-      - JEE Main -> J E E Main
-      - N bhp -> N brake horsepower
-    """
-    s = clean_display_text(text)
-    s = re.sub(r"\bBrahmans?\b", "Brah-mins", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bBrahmins\b", "Brah-mins", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bBrah-mins\s+TV\b", "Brah-mins T V", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bTV\b", "T V", s)
-    s = re.sub(r"\bJEE\s+Main\b", "J E E Main", s, flags=re.IGNORECASE)
-    s = re.sub(r"\b(\d+(?:\.\d+)?)\s*bhp\b", r"\1 brake horsepower", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bIST\b", "I S T", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _local_name(tag: str) -> str:
-    return tag.split("}", 1)[-1].lower() if tag else ""
+def expand_for_brisk_tts(text: str) -> str:
+    """
+    Expands abbreviations & tricky terms so brisk TTS never stumbles over short forms
+    or mispronounces Brahmins Television.
+    """
+    s = clean_display_text(text)
+    s = re.sub(r"\bBrahmans?\b", "Brahmins", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bBrahmins\s+TV\b", "Brahmins Television", s, flags=re.IGNORECASE)
+
+    for abbr, expansion in ABBREVIATION_MAP.items():
+        pattern = r"\b" + re.escape(abbr) + r"\b"
+        s = re.sub(pattern, expansion, s)
+
+    # Spell out remaining all-caps acronyms of 2-5 letters so TTS doesn't mangle them
+    def _spell_caps(match: re.Match) -> str:
+        token = match.group(0)
+        if token in ("I", "A"):
+            return token
+        return " ".join(list(token))
+
+    s = re.sub(r"\b[A-Z]{2,5}\b", _spell_caps, s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def _extract_img_from_html(html_text: str) -> str:
-    if not html_text:
-        return ""
-    m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html_text, flags=re.IGNORECASE)
-    if m:
-        url = m.group(1).strip()
-        if url.startswith("//"):
-            url = "https:" + url
-        if url.startswith("http") and "pixel" not in url.lower() and "1x1" not in url.lower():
-            return url
+def _get_ist_now() -> dt.datetime:
+    ist = dt.timezone(dt.timedelta(hours=5, minutes=30))
+    return dt.datetime.now(ist)
+
+
+def _resolve_time_window() -> Tuple[int, int, str]:
+    """
+    Returns (start_hour, end_hour, slot_label) in 24h IST:
+      - 22:00 to 05:00 -> 1st / morning bulletin
+      - 05:00 to 11:00 -> 12 PM bulletin
+      - 11:00 to 16:00 -> 5 PM bulletin
+      - 16:00 to 21:00 -> 10 PM bulletin
+    Supports explicit override via BULLETIN_SLOT or TIME_WINDOW_START / TIME_WINDOW_END.
+    """
+    slot = os.environ.get("BULLETIN_SLOT", "").strip().lower()
+    slot_map = {
+        "morning": (22, 5, "1st Bulletin (10 PM - 5 AM)"),
+        "1st": (22, 5, "1st Bulletin (10 PM - 5 AM)"),
+        "12pm": (5, 11, "12 PM Bulletin (5 AM - 11 AM)"),
+        "noon": (5, 11, "12 PM Bulletin (5 AM - 11 AM)"),
+        "5pm": (11, 16, "5 PM Bulletin (11 AM - 4 PM)"),
+        "evening": (11, 16, "5 PM Bulletin (11 AM - 4 PM)"),
+        "10pm": (16, 21, "10 PM Bulletin (4 PM - 9 PM)"),
+        "night": (16, 21, "10 PM Bulletin (4 PM - 9 PM)"),
+    }
+    if slot in slot_map:
+        return slot_map[slot]
+
+    s_env = os.environ.get("TIME_WINDOW_START", "").strip()
+    e_env = os.environ.get("TIME_WINDOW_END", "").strip()
+    if s_env.isdigit() and e_env.isdigit():
+        return int(s_env) % 24, int(e_env) % 24, f"Custom ({s_env}:00 - {e_env}:00)"
+
+    now_h = _get_ist_now().hour
+    if now_h >= 22 or now_h < 5:
+        return 22, 5, "1st Bulletin (10 PM - 5 AM)"
+    if 5 <= now_h < 11:
+        return 5, 11, "12 PM Bulletin (5 AM - 11 AM)"
+    if 11 <= now_h < 16:
+        return 11, 16, "5 PM Bulletin (11 AM - 4 PM)"
+    return 16, 21, "10 PM Bulletin (4 PM - 9 PM)"
+
+
+def _parse_item_datetime(row: Dict[str, Any]) -> Optional[dt.datetime]:
+    for key in ("published_at", "publishedAt", "pubDate", "pub_date", "created_at", "createdAt", "timestamp", "date", "time"):
+        val = row.get(key)
+        if not val:
+            continue
+        if isinstance(val, (int, float)):
+            try:
+                ts = float(val)
+                if ts > 1e12:
+                    ts /= 1000.0
+                return dt.datetime.fromtimestamp(ts, tz=dt.timezone(dt.timedelta(hours=5, minutes=30)))
+            except Exception:
+                continue
+        s = str(val).strip()
+        if not s:
+            continue
+        try:
+            parsed = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone(dt.timedelta(hours=5, minutes=30)))
+            return parsed.astimezone(dt.timezone(dt.timedelta(hours=5, minutes=30)))
+        except Exception:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%m-%Y %H:%M", "%d/%m/%Y %H:%M"):
+            try:
+                parsed = dt.datetime.strptime(s, fmt).replace(tzinfo=dt.timezone(dt.timedelta(hours=5, minutes=30)))
+                return parsed
+            except Exception:
+                continue
+    return None
+
+
+def _hour_in_window(hour: int, start_h: int, end_h: int) -> bool:
+    if start_h == end_h:
+        return True
+    if start_h < end_h:
+        return start_h <= hour < end_h
+    # Wraps across midnight (e.g. 22 to 5)
+    return hour >= start_h or hour < end_h
+
+
+def _viral_score(item: Dict[str, Any], start_h: int, end_h: int, order_idx: int) -> float:
+    score = 0.0
+    dt_obj = item.get("_dt")
+    if isinstance(dt_obj, dt.datetime):
+        if _hour_in_window(dt_obj.hour, start_h, end_h):
+            score += 100.0
+        # Newer items slightly higher within window
+        age_hours = max(0.0, (_get_ist_now() - dt_obj).total_seconds() / 3600.0)
+        score += max(0.0, 24.0 - min(24.0, age_hours))
+
+    text_blob = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+    for kw in VIRAL_KEYWORDS:
+        if re.search(r"\b" + re.escape(kw) + r"\b", text_blob):
+            score += 8.0
+
+    # Preserve earlier top50/archive ordering tie-breaker
+    score += max(0.0, 10.0 - (order_idx * 0.15))
+    return score
+
+
+def _extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if isinstance(payload, dict):
+        for key in ("top50", "top_50", "archive", "items", "records", "news", "data", "articles"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                return [r for r in val if isinstance(r, dict)]
+    return []
+
+
+def _normalize_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    title = clean_display_text(
+        row.get("title")
+        or row.get("headline")
+        or row.get("news_title")
+        or row.get("subject")
+        or ""
+    )
+    if not title or len(title) < 8:
+        return None
+
+    summary = clean_display_text(
+        row.get("summary")
+        or row.get("description")
+        or row.get("excerpt")
+        or row.get("body")
+        or title
+    )
+    image_url = clean_display_text(
+        row.get("image_url")
+        or row.get("imageUrl")
+        or row.get("image")
+        or row.get("thumbnail")
+        or row.get("og_image")
+        or ""
+    )
+    if image_url.startswith("//"):
+        image_url = "https:" + image_url
+
+    status = str(row.get("status") or row.get("bulletin_status") or "pending").strip().lower()
+    if status in ("published_video", "aired", "discarded", "rejected", "duplicate"):
+        return None
+
+    return {
+        "title": title,
+        "summary": summary[:220],
+        "image_url": image_url if image_url.startswith("http") else "",
+        "_dt": _parse_item_datetime(row),
+    }
+
+
+def _load_records_from_file(path: str) -> List[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        if path.lower().endswith(".json"):
+            data = json.load(f)
+            return _extract_rows_from_payload(data)
+        reader = csv.DictReader(f)
+        return [dict(r) for r in reader]
+
+
+def _resolve_archive_url() -> str:
+    explicit = os.environ.get("ARCHIVE_JSON_URL", "").strip() or os.environ.get("TOP50_JSON_URL", "").strip()
+    if explicit:
+        return explicit
+
+    base_url = os.environ.get("APPS_SCRIPT_URL", "").strip()
+    if base_url:
+        sep = "&" if "?" in base_url else "?"
+        return f"{base_url}{sep}view=archive"
     return ""
 
 
-def parse_rss_entries(xml_bytes: bytes) -> List[Dict[str, str]]:
-    entries: List[Dict[str, str]] = []
-    root = ET.fromstring(xml_bytes)
-    raw_items = [elem for elem in root.iter() if _local_name(elem.tag) in ("item", "entry")]
+def fetch_from_top50_or_archive(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
+    """
+    Loads stories from Brahmins TV's own Top 50 / Archive (local files or Apps Script JSON),
+    selects stories matching the bulletin time window and viral/breaking priority,
+    and falls back to remaining pending Top 50 / Archive items if needed.
+    """
+    start_h, end_h, slot_label = _resolve_time_window()
+    raw_rows: List[Dict[str, Any]] = []
+    source_used = ""
 
-    for node in raw_items:
-        title = ""
-        summary_raw = ""
-        image_url = ""
-
-        for child in node:
-            cname = _local_name(child.tag)
-            if cname == "title" and not title:
-                title = "".join(child.itertext())
-            elif cname in ("description", "summary", "encoded", "content") and not summary_raw:
-                # Preserve inner XML/HTML so <img src="..."> can be extracted
-                inner_parts = [child.text or ""]
-                for sub in child:
-                    inner_parts.append(ET.tostring(sub, encoding="unicode"))
-                summary_raw = "".join(inner_parts)
-            elif cname in ("thumbnail", "enclosure") or (cname == "content" and child.attrib.get("url")):
-                url_attr = child.attrib.get("url") or child.attrib.get("href") or ""
-                mime = (child.attrib.get("type") or "").lower()
-                if url_attr and (
-                    cname == "thumbnail"
-                    or "image" in mime
-                    or re.search(r"\.(jpg|jpeg|png|webp)", url_attr.lower())
-                ):
-                    if not image_url:
-                        image_url = url_attr
-            elif cname == "link":
-                href = child.attrib.get("href") or ""
-                rel = (child.attrib.get("rel") or "").lower()
-                mime = (child.attrib.get("type") or "").lower()
-                if href and not image_url and (rel == "enclosure" or "image" in mime):
-                    image_url = href
-
-        if not image_url and summary_raw:
-            image_url = _extract_img_from_html(summary_raw)
-
-        if title:
-            entries.append({
-                "title": title,
-                "summary": summary_raw or title,
-                "image_url": image_url,
-            })
-
-    return entries
-
-
-def fetch_news_items(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
-    items: List[Dict[str, str]] = []
-    seen_titles = set()
-
-    items_file = os.environ.get("NEWS_ITEMS_FILE", "").strip()
-    if items_file and os.path.exists(items_file):
-        with open(items_file, "r", encoding="utf-8") as f:
-            if items_file.lower().endswith(".json"):
-                raw = json.load(f)
-                for row in raw:
-                    title = clean_display_text(row.get("title", ""))
-                    if title and title.lower() not in seen_titles:
-                        seen_titles.add(title.lower())
-                        items.append({
-                            "title": title,
-                            "summary": clean_display_text(row.get("summary", title)),
-                            "image_url": (row.get("image_url") or "").strip(),
-                        })
-            else:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    title = clean_display_text(row.get("title") or row.get("headline") or "")
-                    if title and title.lower() not in seen_titles:
-                        seen_titles.add(title.lower())
-                        items.append({
-                            "title": title,
-                            "summary": clean_display_text(row.get("summary") or title),
-                            "image_url": (row.get("image_url") or "").strip(),
-                        })
-
-    feeds_env = os.environ.get("RSS_FEEDS_JSON", "").strip()
-    feeds = json.loads(feeds_env) if feeds_env else DEFAULT_FEEDS
-
-    for feed_url in feeds:
-        if len(items) >= limit:
+    # 1. Explicit env file paths first (TOP50_FILE, ARCHIVE_FILE, NEWS_ITEMS_FILE)
+    for env_key in ("TOP50_FILE", "ARCHIVE_FILE", "NEWS_ITEMS_FILE"):
+        fpath = os.environ.get(env_key, "").strip()
+        if fpath and os.path.exists(fpath):
+            raw_rows = _load_records_from_file(fpath)
+            source_used = fpath
             break
-        try:
-            req = urllib.request.Request(
-                feed_url,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-            )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                xml_data = resp.read()
-            for entry in parse_rss_entries(xml_data):
-                if len(items) >= limit:
-                    break
-                title = clean_display_text(entry.get("title", ""))
-                if not title or len(title) < 12:
-                    continue
-                key = title.lower()
-                if key in seen_titles:
-                    continue
-                seen_titles.add(key)
 
-                summary = clean_display_text(entry.get("summary", title))
-                items.append({
-                    "title": title,
-                    "summary": summary[:180],
-                    "image_url": (entry.get("image_url") or "").strip(),
-                })
-        except Exception as e:
-            print(f"[WARN] Feed failed {feed_url}: {e}")
+    # 2. Local repo Top 50 / Archive files
+    if not raw_rows:
+        for candidate in LOCAL_SOURCE_CANDIDATES:
+            if os.path.exists(candidate):
+                raw_rows = _load_records_from_file(candidate)
+                source_used = candidate
+                break
+
+    # 3. Apps Script Archive / Top 50 JSON endpoint
+    if not raw_rows:
+        archive_url = _resolve_archive_url()
+        if archive_url:
+            try:
+                req = urllib.request.Request(
+                    archive_url,
+                    headers={"User-Agent": "BrahminsTV-BulletinBuilder/2.0"},
+                )
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                raw_rows = _extract_rows_from_payload(payload)
+                source_used = archive_url
+            except Exception as e:
+                print(f"[WARN] Failed to load Top 50 / Archive URL ({archive_url}): {e}")
+
+    normalized: List[Dict[str, Any]] = []
+    seen_titles = set()
+    for r in raw_rows:
+        norm = _normalize_row(r)
+        if not norm:
             continue
+        key = norm["title"].lower()
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+        normalized.append(norm)
 
-    while len(items) < min(limit, 5):
-        idx = len(items) + 1
-        items.append({
-            "title": f"Top Story {idx} on Brah-mins Television",
-            "summary": f"Latest update number {idx} from Brah-mins Television news desk.",
+    scored: List[Tuple[float, int, Dict[str, Any]]] = []
+    for idx, item in enumerate(normalized):
+        s = _viral_score(item, start_h, end_h, idx)
+        scored.append((s, idx, item))
+
+    scored.sort(key=lambda tup: (-tup[0], tup[1]))
+    selected = [tup[2] for tup in scored[:limit]]
+
+    while len(selected) < min(limit, 5):
+        n = len(selected) + 1
+        selected.append({
+            "title": f"Breaking Update {n} from Brahmins Television",
+            "summary": f"Latest report {n} from the Brahmins Television news archive.",
             "image_url": "",
+            "_dt": None,
         })
 
-    print(f"[INFO] Fetched {len(items)} news items ({sum(1 for x in items if x['image_url'])} with image URLs)")
-    return items[:limit]
+    print(
+        f"[INFO] Source: {source_used or 'built-in archive fallback'} | "
+        f"Window: {slot_label} | Selected {len(selected)} stories"
+    )
+    return [{"title": it["title"], "summary": it["summary"], "image_url": it["image_url"]} for it in selected]
 
 
-def generate_fallback_news_visual(story_num: int, headline: str, pw: int, ph: int) -> Image.Image:
+def generate_clean_fallback_visual(story_num: int, headline: str, pw: int, ph: int) -> Image.Image:
     """
-    Generates a crisp, high-contrast broadcast visual card when an RSS item has no valid web image
-    so the upper photo slot is NEVER blank dark navy. Contains NO extra logo inside the image.
+    Clean borderless dark-gold studio gradient & vignette card when an archive item
+    has no image URL. Zero grid lines, zero corner badges that can clip on pan.
     """
-    palettes = [
-        ((18, 36, 84), (178, 24, 38), (245, 196, 62)),
-        ((42, 18, 78), (196, 36, 68), (255, 210, 75)),
-        ((14, 52, 74), (204, 68, 24), (255, 224, 102)),
-        ((58, 16, 48), (188, 28, 44), (248, 200, 70)),
+    themes = [
+        ((16, 22, 46), (48, 16, 28), (218, 172, 66)),
+        ((20, 16, 44), (16, 44, 62), (225, 182, 74)),
+        ((36, 15, 24), (18, 24, 52), (212, 164, 58)),
     ]
-    c1, c2, accent = palettes[(story_num - 1) % len(palettes)]
+    c_top, c_bot, gold = themes[(story_num - 1) % len(themes)]
 
-    card = Image.new("RGB", (pw, ph), c1)
+    card = Image.new("RGB", (pw, ph), c_top)
     draw = ImageDraw.Draw(card)
 
-    # Diagonal broadcast backdrop stripes
-    for y in range(0, ph, 6):
-        ratio = y / max(1, ph)
-        r = int(c1[0] * (1 - ratio) + c2[0] * ratio)
-        g = int(c1[1] * (1 - ratio) + c2[1] * ratio)
-        b = int(c1[2] * (1 - ratio) + c2[2] * ratio)
-        draw.line([(0, y), (pw, y)], fill=(r, g, b), width=6)
+    for y in range(ph):
+        ratio = y / max(1, ph - 1)
+        r = int(c_top[0] * (1 - ratio) + c_bot[0] * ratio)
+        g = int(c_top[1] * (1 - ratio) + c_bot[1] * ratio)
+        b = int(c_top[2] * (1 - ratio) + c_bot[2] * ratio)
+        draw.line([(0, y), (pw, y)], fill=(r, g, b), width=1)
 
-    # Subtle geometric broadcast grid lines
-    for gx in range(0, pw, 90):
-        draw.line([(gx, 0), (gx, ph)], fill=(255, 255, 255, 25), width=1)
-    for gy in range(0, ph, 90):
-        draw.line([(0, gy), (pw, gy)], fill=(255, 255, 255, 25), width=1)
+    # Subtle gold accent bar centered cleanly with generous margin
+    bar_w = 180
+    bar_x = (pw - bar_w) // 2
+    bar_y = int(ph * 0.24)
+    draw.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + 5], fill=gold)
 
-    # Top-left story badge: "NEWS 01 / 25"
-    badge_font = load_font(34)
-    badge_text = f"NEWS {story_num:02d} / {MAX_ITEMS:02d}"
-    bx1, by1, bx2, by2 = 36, 32, 310, 92
-    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=10, fill=accent)
-    draw.text((bx1 + 22, by1 + 12), badge_text, font=badge_font, fill=(15, 15, 25))
-
-    # Central summary card inside visual frame
-    keywords = [w.upper() for w in re.findall(r"[A-Za-z0-9']+", headline) if len(w) > 2][:6]
-    banner_text = " • ".join(keywords[:3]) if keywords else "TOP HEADLINE"
-    sub_text = " ".join(keywords[3:6]) if len(keywords) > 3 else "INDIA DESK UPDATE"
-
-    big_font = load_font(54)
-    sub_font = load_font(36)
-    lines = wrap_lines_clean(draw, banner_text, big_font, pw - 120, max_lines=3)
-    y_cursor = ph // 2 - (len(lines) * 66) // 2
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=big_font)
+    # Clean centered headline summary inside safe inner box
+    headline_font = load_font(42)
+    lines = wrap_lines_clean(draw, clean_display_text(headline), headline_font, pw - 140, max_lines=4)
+    line_h = 54
+    start_y = max(bar_y + 28, (ph - len(lines) * line_h) // 2)
+    for idx, line in enumerate(lines):
+        bbox = draw.textbbox((0, 0), line, font=headline_font)
         lw = bbox[2] - bbox[0]
         lx = (pw - lw) // 2
-        draw.text((lx + 3, y_cursor + 3), line, font=big_font, fill=(0, 0, 0))
-        draw.text((lx, y_cursor), line, font=big_font, fill=(255, 255, 255))
-        y_cursor += 68
-
-    sbbox = draw.textbbox((0, 0), sub_text, font=sub_font)
-    slw = sbbox[2] - sbbox[0]
-    draw.text(((pw - slw) // 2, y_cursor + 16), sub_text, font=sub_font, fill=accent)
+        ly = start_y + idx * line_h
+        draw.text((lx + 2, ly + 2), line, font=headline_font, fill=(0, 0, 0))
+        draw.text((lx, ly), line, font=headline_font, fill=(248, 250, 252))
 
     return card
 
@@ -318,9 +462,9 @@ def load_story_photo(image_url: str, story_num: int, headline: str) -> Image.Ima
             if img.width >= 200 and img.height >= 120:
                 return img
         except Exception as e:
-            print(f"[WARN] Image download failed for story {story_num} ({image_url}): {e}")
+            print(f"[WARN] Image load failed for story {story_num}: {e}")
 
-    return generate_fallback_news_visual(story_num, headline, pw, ph)
+    return generate_clean_fallback_visual(story_num, headline, pw, ph)
 
 
 def fit_cover(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
@@ -360,29 +504,30 @@ def wrap_lines_clean(
 
 
 def build_headline_card(headline: str, story_num: int, total_stories: int) -> Image.Image:
-    """Pre-renders the headline text image once per story for crisp, smooth slide-in animation."""
+    """Pre-renders headline text with comfortable top/bottom padding inside SLOT_NEWS."""
     nx1, ny1, nx2, ny2 = SLOT_NEWS
     box_w, box_h = nx2 - nx1, ny2 - ny1
     card = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(card)
 
-    pad_x, pad_y = 32, 20
+    pad_x = 36
+    top_margin = 48
+    bottom_margin = 24
     inner_w = box_w - pad_x * 2
-    inner_h = box_h - pad_y * 2 - 36
+    inner_h = box_h - top_margin - bottom_margin
 
-    # Small story counter pill at top-right inside lower box
-    counter_font = load_font(24)
-    counter_txt = f"{story_num:02d}/{total_stories:02d}"
+    counter_font = load_font(22)
+    counter_txt = f"{story_num:02d} / {total_stories:02d}"
     cbbox = draw.textbbox((0, 0), counter_txt, font=counter_font)
     cw = cbbox[2] - cbbox[0]
-    draw.text((box_w - cw - 28, 12), counter_txt, font=counter_font, fill=(255, 215, 80, 255))
+    draw.text((box_w - cw - 28, 16), counter_txt, font=counter_font, fill=(245, 200, 75, 255))
 
     headline_clean = clean_display_text(headline)
-    chosen_size = 44
+    chosen_size = 42
     chosen_font = load_font(chosen_size)
     chosen_lines = wrap_lines_clean(draw, headline_clean, chosen_font, inner_w, max_lines=4)
 
-    for sz in [44, 38, 34, 30]:
+    for sz in [42, 38, 34, 30]:
         f = load_font(sz)
         lines = wrap_lines_clean(draw, headline_clean, f, inner_w, max_lines=4)
         line_step = sz + 10
@@ -394,7 +539,7 @@ def build_headline_card(headline: str, story_num: int, total_stories: int) -> Im
 
     line_step = chosen_size + 10
     total_text_h = len(chosen_lines) * line_step
-    start_y = 34 + pad_y + max(0, (inner_h - total_text_h) // 2)
+    start_y = top_margin + max(0, (inner_h - total_text_h) // 2)
 
     for idx, line in enumerate(chosen_lines):
         bbox = draw.textbbox((0, 0), line, font=chosen_font)
@@ -414,20 +559,15 @@ def render_frame_fast(
     progress: float,
     direction: int,
 ) -> bytes:
-    """
-    Renders one 1080x1920 RGB frame:
-      1) Upper slot: smooth Ken Burns zoom (1.00x -> 1.12x) + directional pan
-      2) Lower slot: smooth ease-out slide-in of the breaking-news headline during first 0.45s
-    """
     t = max(0.0, min(1.0, progress))
     ease = 0.5 - 0.5 * math.cos(math.pi * t)
 
     frame = base_template.copy()
 
-    # 1. Upper Photo Slot: smooth zoom (1.00x -> 1.12x) & pan
+    # 1. Upper Photo Slot: smooth Ken Burns zoom (1.00x -> 1.11x) & gentle pan
     px1, py1, px2, py2 = SLOT_PHOTO
     pw, ph = px2 - px1, py2 - py1
-    zoom = 1.0 + 0.12 * ease
+    zoom = 1.0 + 0.11 * ease
     zw = max(pw, int(round(base_photo.width * zoom)))
     zh = max(ph, int(round(base_photo.height * zoom)))
     zoomed = base_photo.resize((zw, zh), Image.Resampling.BILINEAR)
@@ -440,11 +580,11 @@ def render_frame_fast(
     crop_box = zoomed.crop((crop_x, crop_y, crop_x + pw, crop_y + ph)).convert("RGBA")
     frame.paste(crop_box, (px1, py1))
 
-    # 2. Lower Breaking News Slot: smooth horizontal slide-in entrance
+    # 2. Lower Breaking News Slot: brisk ease-out slide-in entrance
     nx1, ny1, nx2, ny2 = SLOT_NEWS
-    enter_t = min(1.0, t / 0.15)  # smooth slide over initial ~15% of segment
+    enter_t = min(1.0, t / 0.14)
     slide_ease = 1.0 - (1.0 - enter_t) ** 3
-    offset_x = int(round((1.0 - slide_ease) * 140))
+    offset_x = int(round((1.0 - slide_ease) * 120))
     box_w, box_h = nx2 - nx1, ny2 - ny1
     visible_card = headline_card.crop((0, 0, max(1, box_w - offset_x), box_h))
     frame.alpha_composite(visible_card, (nx1 + offset_x, ny1))
@@ -466,46 +606,81 @@ def probe_duration_seconds(media_path: str) -> float:
         return 0.0
 
 
-def synthesize_voiceover(spoken_text: str, out_wav: str, idx: int) -> float:
-    """
-    Produces guaranteed audible speech WAV for every segment:
-      1) Primary: gTTS (Indian English co.in) -> decoded to 44.1kHz mono WAV
-      2) Offline Backup: espeak-ng -> 44.1kHz mono WAV (never silent!)
-    """
+def _apply_brisk_voice_shaping(in_wav: str, out_wav: str, voice_cfg: Dict[str, Any]) -> None:
+    """Applies brisk tempo & pitch shift so each of the 3 female + 2 male voices sounds distinct and energetic."""
+    tempo = float(voice_cfg.get("tempo", 1.15))
+    semitones = float(voice_cfg.get("pitch_semitones", 0.0))
+    pitch_factor = 2.0 ** (semitones / 12.0)
+
+    # Shift pitch via sample rate adjustment + asetrate compensation, then apply brisk atempo
+    shifted_rate = int(round(44100 * pitch_factor))
+    comp_tempo = tempo / pitch_factor
+    filters = [f"asetrate={shifted_rate}", "aresample=44100"]
+
+    # Chain atempo filters in [0.5, 2.0] range safely
+    rem = comp_tempo
+    while rem > 2.0:
+        filters.append("atempo=2.0")
+        rem /= 2.0
+    while rem < 0.5:
+        filters.append("atempo=0.5")
+        rem /= 0.5
+    filters.append(f"atempo={rem:.4f}")
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", in_wav, "-filter:a", ",".join(filters), "-ar", "44100", "-ac", "1", out_wav],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
+
+
+def synthesize_brisk_voiceover(spoken_text: str, out_wav: str, idx: int) -> float:
+    voice_cfg = VOICE_ROSTER[idx % len(VOICE_ROSTER)]
+    base_wav = out_wav + ".base.wav"
     tmp_mp3 = out_wav + ".mp3"
+    got_base = False
+
     try:
         from gtts import gTTS
         tts = gTTS(text=spoken_text, lang="en", tld="co.in", slow=False)
         tts.save(tmp_mp3)
         subprocess.run(
-            ["ffmpeg", "-y", "-i", tmp_mp3, "-ar", "44100", "-ac", "1", out_wav],
+            ["ffmpeg", "-y", "-i", tmp_mp3, "-ar", "44100", "-ac", "1", base_wav],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True,
         )
-        dur = probe_duration_seconds(out_wav)
-        if dur > 0.6:
-            return dur
+        if probe_duration_seconds(base_wav) > 0.5:
+            got_base = True
     except Exception as e:
-        print(f"[WARN] gTTS failed on segment {idx}, switching to offline espeak-ng: {e}")
+        print(f"[WARN] gTTS fallback on seg {idx} ({voice_cfg['name']}): {e}")
 
-    # Offline TTS fallback so audio is ALWAYS audible
-    raw_espeak = out_wav + ".raw.wav"
-    subprocess.run(
-        ["espeak-ng", "-v", "en-in", "-s", "155", "-w", raw_espeak, spoken_text],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True,
-    )
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", raw_espeak, "-ar", "44100", "-ac", "1", out_wav],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True,
-    )
+    if not got_base:
+        raw_espeak = out_wav + ".raw.wav"
+        subprocess.run(
+            [
+                "espeak-ng",
+                "-v", str(voice_cfg["espeak"]),
+                "-s", str(voice_cfg["speed"]),
+                "-w", raw_espeak,
+                spoken_text,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", raw_espeak, "-ar", "44100", "-ac", "1", base_wav],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+
+    _apply_brisk_voice_shaping(base_wav, out_wav, voice_cfg)
     dur = probe_duration_seconds(out_wav)
     if dur <= 0.3:
-        raise RuntimeError(f"Both gTTS and espeak-ng failed to produce audio for segment {idx}")
+        raise RuntimeError(f"Failed to produce audio for segment {idx}")
     return dur
 
 
@@ -522,8 +697,8 @@ def build_segment_video(
     audio_path = os.path.join(workdir, f"seg_{idx:02d}.wav")
     seg_mp4 = os.path.join(workdir, f"seg_{idx:02d}.mp4")
 
-    audio_dur = synthesize_voiceover(spoken_text, audio_path, idx)
-    total_dur = max(2.8, audio_dur + 0.35)
+    audio_dur = synthesize_brisk_voiceover(spoken_text, audio_path, idx)
+    total_dur = max(2.4, audio_dur + 0.25)
     num_frames = max(24, int(math.ceil(total_dur * FPS)))
 
     px1, py1, px2, py2 = SLOT_PHOTO
@@ -607,7 +782,7 @@ def main() -> None:
         raise FileNotFoundError(f"Missing studio template: {TEMPLATE_PATH}")
 
     base_template = Image.open(TEMPLATE_PATH).convert("RGBA").resize((W, H), Image.Resampling.LANCZOS)
-    items = fetch_news_items(limit=MAX_ITEMS)
+    items = fetch_from_top50_or_archive(limit=MAX_ITEMS)
     total_stories = len(items)
 
     output_path = os.environ.get("OUTPUT_MP4_PATH", "top25-latest.mp4")
@@ -615,10 +790,11 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         segments: List[str] = []
 
+        # 1st news image shown as opening hook segment
         first_item = items[0]
         first_photo = load_story_photo(first_item["image_url"], 1, first_item["title"])
-        hook_spoken = clean_for_tts(
-            f"Top 25 news stories right now on Brah-mins Television! Number 1: {first_item['title']}."
+        hook_spoken = expand_for_brisk_tts(
+            f"Top 25 news stories right now on Brahmins Television! {first_item['title']}."
         )
         segments.append(
             build_segment_video(
@@ -635,11 +811,11 @@ def main() -> None:
 
         running_sec = probe_duration_seconds(segments[0])
         for i, item in enumerate(items[1:], start=1):
-            if running_sec >= TARGET_MAX_SECONDS - 4.0:
+            if running_sec >= TARGET_MAX_SECONDS - 3.5:
                 break
             story_num = i + 1
             photo = load_story_photo(item["image_url"], story_num, item["title"])
-            spoken = clean_for_tts(f"Number {story_num}: {item['title']}.")
+            spoken = expand_for_brisk_tts(f"{item['title']}.")
             seg = build_segment_video(
                 base_template=base_template,
                 photo_rgb=photo,
