@@ -2,7 +2,7 @@ name: Build and Publish Top 25 Bulletin
 
 on:
   workflow_dispatch:
-  
+
 permissions:
   contents: write
 
@@ -19,26 +19,28 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install FFmpeg, fonts, and Python packages
+      - name: Install FFmpeg, TTS, fonts, and Python packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-liberation
-          pip install --upgrade pip
-          pip install requests edge-tts pillow numpy
+          sudo apt-get install -y --no-install-recommends ffmpeg espeak-ng fonts-dejavu-core fonts-liberation
+          python -m pip install --upgrade pip
+          pip install pillow gTTS
 
       - name: Build 9:16 Top 25 news bulletin
         env:
-          NEWS_FEED_URL: ${{ secrets.NEWS_FEED_URL }}
-        run: python build_bulletin.py
+          STUDIO_TEMPLATE_PATH: assets/studio_template_9x16.png
+          OUTPUT_MP4_PATH: top25-latest.mp4
+        run: |
+          python build_bulletin.py
+          ls -lh top25-latest.mp4
 
       - name: Publish to GitHub Release (latest-bulletin)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-bulletin
+          name: Latest Top 25 Bulletin
+          body: Automated 9:16 Top 25 news bulletin built by Brahmins TV pipeline.
+          files: top25-latest.mp4
+          make_latest: true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create latest-bulletin top25-latest.mp4 \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Latest Top 25 Bulletin" \
-            --notes "Automated 9:16 Brahmins TV Top 25 News Shots bulletin." \
-            || gh release upload latest-bulletin top25-latest.mp4 \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
