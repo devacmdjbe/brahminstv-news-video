@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
 Brahmins TV - Top 25 News Shots Vertical (9:16) Bulletin Builder
-Uses fixed studio template (assets/studio_template_9x16.png) and updates ONLY:
-  1. Upper news image slot (smooth ease-in-out zoom/pan, no extra logo inside image)
-  2. Lower flash news slot (clean wrapped headline text, zero mid-word wrap splits)
+Guaranteed fixes:
+  1. Images: Extracts image URLs from RSS media tags, enclosures, AND HTML <img> tags inside description/content;
+     generates a clean, branded dynamic news visual card if a story has no valid web image (never blank).
+  2. Audio: Uses reliable gTTS + offline espeak-ng fallback (installed in workflow) so every segment ALWAYS
+     has spoken Indian-English audio with "Brah-mins Television / T V" pronunciation (never silent).
+  3. Smooth Animation: Per-frame smooth Ken Burns zoom/pan + horizontal breaking-news ticker/entrance slide.
 """
 
 import csv
@@ -37,12 +40,12 @@ SLOT_PHOTO: Tuple[int, int, int, int] = (36, 418, 1044, 1110)
 SLOT_NEWS: Tuple[int, int, int, int] = (44, 1272, 1036, 1608)
 
 DEFAULT_FEEDS = [
-    "https://www.news18.com/rss/india.xml",
-    "https://feeds.feedburner.com/ndtvnews-top-stories",
-    "https://www.timesnownews.com/feeds/gns-en-latest.xml",
-    "https://www.republicworld.com/rss/india.xml",
-    "https://www.indiatoday.in/rss/1206578",
+    "https://www.thehindu.com/news/national/feeder/default.rss",
     "https://www.thehindu.com/news/national/tamil-nadu/feeder/default.rss",
+    "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
+    "https://www.indiatoday.in/rss/1206578",
+    "https://feeds.feedburner.com/ndtvnews-top-stories",
+    "https://www.news18.com/rss/india.xml",
 ]
 
 FONT_CANDIDATES = [
@@ -66,6 +69,7 @@ def clean_display_text(text: str) -> str:
         .replace("&quot;", '"')
         .replace("&#39;", "'")
         .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
     )
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -95,24 +99,40 @@ def _local_name(tag: str) -> str:
     return tag.split("}", 1)[-1].lower() if tag else ""
 
 
+def _extract_img_from_html(html_text: str) -> str:
+    if not html_text:
+        return ""
+    m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html_text, flags=re.IGNORECASE)
+    if m:
+        url = m.group(1).strip()
+        if url.startswith("//"):
+            url = "https:" + url
+        if url.startswith("http") and "pixel" not in url.lower() and "1x1" not in url.lower():
+            return url
+    return ""
+
+
 def parse_rss_entries(xml_bytes: bytes) -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
     root = ET.fromstring(xml_bytes)
-
     raw_items = [elem for elem in root.iter() if _local_name(elem.tag) in ("item", "entry")]
 
     for node in raw_items:
         title = ""
-        summary = ""
+        summary_raw = ""
         image_url = ""
 
         for child in node:
             cname = _local_name(child.tag)
             if cname == "title" and not title:
                 title = "".join(child.itertext())
-            elif cname in ("description", "summary", "encoded") and not summary:
-                summary = "".join(child.itertext())
-            elif cname in ("content", "thumbnail", "enclosure"):
+            elif cname in ("description", "summary", "encoded", "content") and not summary_raw:
+                # Preserve inner XML/HTML so <img src="..."> can be extracted
+                inner_parts = [child.text or ""]
+                for sub in child:
+                    inner_parts.append(ET.tostring(sub, encoding="unicode"))
+                summary_raw = "".join(inner_parts)
+            elif cname in ("thumbnail", "enclosure") or (cname == "content" and child.attrib.get("url")):
                 url_attr = child.attrib.get("url") or child.attrib.get("href") or ""
                 mime = (child.attrib.get("type") or "").lower()
                 if url_attr and (
@@ -129,10 +149,13 @@ def parse_rss_entries(xml_bytes: bytes) -> List[Dict[str, str]]:
                 if href and not image_url and (rel == "enclosure" or "image" in mime):
                     image_url = href
 
+        if not image_url and summary_raw:
+            image_url = _extract_img_from_html(summary_raw)
+
         if title:
             entries.append({
                 "title": title,
-                "summary": summary or title,
+                "summary": summary_raw or title,
                 "image_url": image_url,
             })
 
@@ -178,7 +201,7 @@ def fetch_news_items(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
         try:
             req = urllib.request.Request(
                 feed_url,
-                headers={"User-Agent": "Mozilla/5.0 (BrahminsTV-BulletinBuilder/1.0)"},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             )
             with urllib.request.urlopen(req, timeout=8) as resp:
                 xml_data = resp.read()
@@ -196,10 +219,11 @@ def fetch_news_items(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
                 summary = clean_display_text(entry.get("summary", title))
                 items.append({
                     "title": title,
-                    "summary": summary[:220],
+                    "summary": summary[:180],
                     "image_url": (entry.get("image_url") or "").strip(),
                 })
-        except Exception:
+        except Exception as e:
+            print(f"[WARN] Feed failed {feed_url}: {e}")
             continue
 
     while len(items) < min(limit, 5):
@@ -210,27 +234,93 @@ def fetch_news_items(limit: int = MAX_ITEMS) -> List[Dict[str, str]]:
             "image_url": "",
         })
 
+    print(f"[INFO] Fetched {len(items)} news items ({sum(1 for x in items if x['image_url'])} with image URLs)")
     return items[:limit]
 
 
-def load_story_photo(image_url: str, fallback_template: Image.Image) -> Image.Image:
+def generate_fallback_news_visual(story_num: int, headline: str, pw: int, ph: int) -> Image.Image:
+    """
+    Generates a crisp, high-contrast broadcast visual card when an RSS item has no valid web image
+    so the upper photo slot is NEVER blank dark navy. Contains NO extra logo inside the image.
+    """
+    palettes = [
+        ((18, 36, 84), (178, 24, 38), (245, 196, 62)),
+        ((42, 18, 78), (196, 36, 68), (255, 210, 75)),
+        ((14, 52, 74), (204, 68, 24), (255, 224, 102)),
+        ((58, 16, 48), (188, 28, 44), (248, 200, 70)),
+    ]
+    c1, c2, accent = palettes[(story_num - 1) % len(palettes)]
+
+    card = Image.new("RGB", (pw, ph), c1)
+    draw = ImageDraw.Draw(card)
+
+    # Diagonal broadcast backdrop stripes
+    for y in range(0, ph, 6):
+        ratio = y / max(1, ph)
+        r = int(c1[0] * (1 - ratio) + c2[0] * ratio)
+        g = int(c1[1] * (1 - ratio) + c2[1] * ratio)
+        b = int(c1[2] * (1 - ratio) + c2[2] * ratio)
+        draw.line([(0, y), (pw, y)], fill=(r, g, b), width=6)
+
+    # Subtle geometric broadcast grid lines
+    for gx in range(0, pw, 90):
+        draw.line([(gx, 0), (gx, ph)], fill=(255, 255, 255, 25), width=1)
+    for gy in range(0, ph, 90):
+        draw.line([(0, gy), (pw, gy)], fill=(255, 255, 255, 25), width=1)
+
+    # Top-left story badge: "NEWS 01 / 25"
+    badge_font = load_font(34)
+    badge_text = f"NEWS {story_num:02d} / {MAX_ITEMS:02d}"
+    bx1, by1, bx2, by2 = 36, 32, 310, 92
+    draw.rounded_rectangle([bx1, by1, bx2, by2], radius=10, fill=accent)
+    draw.text((bx1 + 22, by1 + 12), badge_text, font=badge_font, fill=(15, 15, 25))
+
+    # Central summary card inside visual frame
+    keywords = [w.upper() for w in re.findall(r"[A-Za-z0-9']+", headline) if len(w) > 2][:6]
+    banner_text = " • ".join(keywords[:3]) if keywords else "TOP HEADLINE"
+    sub_text = " ".join(keywords[3:6]) if len(keywords) > 3 else "INDIA DESK UPDATE"
+
+    big_font = load_font(54)
+    sub_font = load_font(36)
+    lines = wrap_lines_clean(draw, banner_text, big_font, pw - 120, max_lines=3)
+    y_cursor = ph // 2 - (len(lines) * 66) // 2
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=big_font)
+        lw = bbox[2] - bbox[0]
+        lx = (pw - lw) // 2
+        draw.text((lx + 3, y_cursor + 3), line, font=big_font, fill=(0, 0, 0))
+        draw.text((lx, y_cursor), line, font=big_font, fill=(255, 255, 255))
+        y_cursor += 68
+
+    sbbox = draw.textbbox((0, 0), sub_text, font=sub_font)
+    slw = sbbox[2] - sbbox[0]
+    draw.text(((pw - slw) // 2, y_cursor + 16), sub_text, font=sub_font, fill=accent)
+
+    return card
+
+
+def load_story_photo(image_url: str, story_num: int, headline: str) -> Image.Image:
     px1, py1, px2, py2 = SLOT_PHOTO
+    pw, ph = px2 - px1, py2 - py1
 
     if image_url:
         try:
             req = urllib.request.Request(
                 image_url,
-                headers={"User-Agent": "Mozilla/5.0 (BrahminsTV-BulletinBuilder/1.0)"},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                },
             )
-            with urllib.request.urlopen(req, timeout=6) as resp:
+            with urllib.request.urlopen(req, timeout=8) as resp:
                 data = resp.read()
             img = Image.open(io.BytesIO(data)).convert("RGB")
             if img.width >= 200 and img.height >= 120:
                 return img
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] Image download failed for story {story_num} ({image_url}): {e}")
 
-    return fallback_template.crop((px1, py1, px2, py2)).convert("RGB")
+    return generate_fallback_news_visual(story_num, headline, pw, ph)
 
 
 def fit_cover(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
@@ -269,17 +359,25 @@ def wrap_lines_clean(
     return lines
 
 
-def build_static_text_layer(base_template: Image.Image, headline: str) -> Image.Image:
-    """Draws the lower breaking news text once per story onto a copy of the studio template."""
-    layer = base_template.copy()
+def build_headline_card(headline: str, story_num: int, total_stories: int) -> Image.Image:
+    """Pre-renders the headline text image once per story for crisp, smooth slide-in animation."""
     nx1, ny1, nx2, ny2 = SLOT_NEWS
-    pad_x, pad_y = 32, 24
-    inner_w = (nx2 - nx1) - pad_x * 2
-    inner_h = (ny2 - ny1) - pad_y * 2
+    box_w, box_h = nx2 - nx1, ny2 - ny1
+    card = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(card)
 
-    draw = ImageDraw.Draw(layer)
+    pad_x, pad_y = 32, 20
+    inner_w = box_w - pad_x * 2
+    inner_h = box_h - pad_y * 2 - 36
+
+    # Small story counter pill at top-right inside lower box
+    counter_font = load_font(24)
+    counter_txt = f"{story_num:02d}/{total_stories:02d}"
+    cbbox = draw.textbbox((0, 0), counter_txt, font=counter_font)
+    cw = cbbox[2] - cbbox[0]
+    draw.text((box_w - cw - 28, 12), counter_txt, font=counter_font, fill=(255, 215, 80, 255))
+
     headline_clean = clean_display_text(headline)
-
     chosen_size = 44
     chosen_font = load_font(chosen_size)
     chosen_lines = wrap_lines_clean(draw, headline_clean, chosen_font, inner_w, max_lines=4)
@@ -296,43 +394,60 @@ def build_static_text_layer(base_template: Image.Image, headline: str) -> Image.
 
     line_step = chosen_size + 10
     total_text_h = len(chosen_lines) * line_step
-    start_y = ny1 + pad_y + max(0, (inner_h - total_text_h) // 2)
+    start_y = 34 + pad_y + max(0, (inner_h - total_text_h) // 2)
 
     for idx, line in enumerate(chosen_lines):
         bbox = draw.textbbox((0, 0), line, font=chosen_font)
         lw = bbox[2] - bbox[0]
-        lx = nx1 + ((nx2 - nx1) - lw) // 2
+        lx = (box_w - lw) // 2
         ly = start_y + idx * line_step
-        draw.text((lx + 2, ly + 2), line, font=chosen_font, fill=(0, 0, 0, 230))
+        draw.text((lx + 2, ly + 2), line, font=chosen_font, fill=(0, 0, 0, 235))
         draw.text((lx, ly), line, font=chosen_font, fill=(255, 255, 255, 255))
 
-    return layer
+    return card
 
 
 def render_frame_fast(
-    text_layer: Image.Image,
+    base_template: Image.Image,
     base_photo: Image.Image,
+    headline_card: Image.Image,
     progress: float,
+    direction: int,
 ) -> bytes:
-    """Renders one 1080x1920 RGB frame in memory and returns raw bytes for FFmpeg stdin."""
+    """
+    Renders one 1080x1920 RGB frame:
+      1) Upper slot: smooth Ken Burns zoom (1.00x -> 1.12x) + directional pan
+      2) Lower slot: smooth ease-out slide-in of the breaking-news headline during first 0.45s
+    """
     t = max(0.0, min(1.0, progress))
     ease = 0.5 - 0.5 * math.cos(math.pi * t)
 
-    frame = text_layer.copy()
+    frame = base_template.copy()
 
+    # 1. Upper Photo Slot: smooth zoom (1.00x -> 1.12x) & pan
     px1, py1, px2, py2 = SLOT_PHOTO
     pw, ph = px2 - px1, py2 - py1
-    zoom = 1.0 + 0.07 * ease
+    zoom = 1.0 + 0.12 * ease
     zw = max(pw, int(round(base_photo.width * zoom)))
     zh = max(ph, int(round(base_photo.height * zoom)))
     zoomed = base_photo.resize((zw, zh), Image.Resampling.BILINEAR)
 
     max_dx = max(0, zw - pw)
     max_dy = max(0, zh - ph)
-    crop_x = int(round(max_dx * 0.5 * ease))
+    pan_t = ease if direction >= 0 else (1.0 - ease)
+    crop_x = int(round(max_dx * pan_t))
     crop_y = int(round(max_dy * 0.5 * (1.0 - ease)))
     crop_box = zoomed.crop((crop_x, crop_y, crop_x + pw, crop_y + ph)).convert("RGBA")
     frame.paste(crop_box, (px1, py1))
+
+    # 2. Lower Breaking News Slot: smooth horizontal slide-in entrance
+    nx1, ny1, nx2, ny2 = SLOT_NEWS
+    enter_t = min(1.0, t / 0.15)  # smooth slide over initial ~15% of segment
+    slide_ease = 1.0 - (1.0 - enter_t) ** 3
+    offset_x = int(round((1.0 - slide_ease) * 140))
+    box_w, box_h = nx2 - nx1, ny2 - ny1
+    visible_card = headline_card.crop((0, 0, max(1, box_w - offset_x), box_h))
+    frame.alpha_composite(visible_card, (nx1 + offset_x, ny1))
 
     return frame.convert("RGB").tobytes()
 
@@ -351,28 +466,47 @@ def probe_duration_seconds(media_path: str) -> float:
         return 0.0
 
 
-def synthesize_voiceover(spoken_text: str, out_mp3: str) -> float:
+def synthesize_voiceover(spoken_text: str, out_wav: str, idx: int) -> float:
+    """
+    Produces guaranteed audible speech WAV for every segment:
+      1) Primary: gTTS (Indian English co.in) -> decoded to 44.1kHz mono WAV
+      2) Offline Backup: espeak-ng -> 44.1kHz mono WAV (never silent!)
+    """
+    tmp_mp3 = out_wav + ".mp3"
     try:
         from gtts import gTTS
         tts = gTTS(text=spoken_text, lang="en", tld="co.in", slow=False)
-        tts.save(out_mp3)
-        dur = probe_duration_seconds(out_mp3)
-        if dur > 0.5:
+        tts.save(tmp_mp3)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp_mp3, "-ar", "44100", "-ac", "1", out_wav],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        dur = probe_duration_seconds(out_wav)
+        if dur > 0.6:
             return dur
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] gTTS failed on segment {idx}, switching to offline espeak-ng: {e}")
 
-    est_sec = max(2.5, min(8.0, len(spoken_text) / 14.0))
+    # Offline TTS fallback so audio is ALWAYS audible
+    raw_espeak = out_wav + ".raw.wav"
     subprocess.run(
-        [
-            "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
-            "-t", f"{est_sec:.2f}", "-q:a", "9", out_mp3,
-        ],
+        ["espeak-ng", "-v", "en-in", "-s", "155", "-w", raw_espeak, spoken_text],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=True,
     )
-    return est_sec
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", raw_espeak, "-ar", "44100", "-ac", "1", out_wav],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
+    dur = probe_duration_seconds(out_wav)
+    if dur <= 0.3:
+        raise RuntimeError(f"Both gTTS and espeak-ng failed to produce audio for segment {idx}")
+    return dur
 
 
 def build_segment_video(
@@ -382,17 +516,20 @@ def build_segment_video(
     spoken_text: str,
     workdir: str,
     idx: int,
+    story_num: int,
+    total_stories: int,
 ) -> str:
-    audio_path = os.path.join(workdir, f"seg_{idx:02d}.mp3")
+    audio_path = os.path.join(workdir, f"seg_{idx:02d}.wav")
     seg_mp4 = os.path.join(workdir, f"seg_{idx:02d}.mp4")
 
-    audio_dur = synthesize_voiceover(spoken_text, audio_path)
-    total_dur = max(2.5, audio_dur + 0.35)
-    num_frames = max(12, int(math.ceil(total_dur * FPS)))
+    audio_dur = synthesize_voiceover(spoken_text, audio_path, idx)
+    total_dur = max(2.8, audio_dur + 0.35)
+    num_frames = max(24, int(math.ceil(total_dur * FPS)))
 
     px1, py1, px2, py2 = SLOT_PHOTO
     base_photo = fit_cover(photo_rgb, px2 - px1, py2 - py1)
-    text_layer = build_static_text_layer(base_template, headline)
+    headline_card = build_headline_card(headline, story_num, total_stories)
+    direction = 1 if (idx % 2 == 0) else -1
 
     proc = subprocess.Popen(
         [
@@ -424,7 +561,7 @@ def build_segment_video(
     try:
         for f_idx in range(num_frames):
             progress = f_idx / max(1, num_frames - 1)
-            proc.stdin.write(render_frame_fast(text_layer, base_photo, progress))
+            proc.stdin.write(render_frame_fast(base_template, base_photo, headline_card, progress, direction))
     except BrokenPipeError:
         err_out = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
         proc.wait()
@@ -471,6 +608,7 @@ def main() -> None:
 
     base_template = Image.open(TEMPLATE_PATH).convert("RGBA").resize((W, H), Image.Resampling.LANCZOS)
     items = fetch_news_items(limit=MAX_ITEMS)
+    total_stories = len(items)
 
     output_path = os.environ.get("OUTPUT_MP4_PATH", "top25-latest.mp4")
 
@@ -478,9 +616,9 @@ def main() -> None:
         segments: List[str] = []
 
         first_item = items[0]
-        first_photo = load_story_photo(first_item["image_url"], base_template)
+        first_photo = load_story_photo(first_item["image_url"], 1, first_item["title"])
         hook_spoken = clean_for_tts(
-            f"Top 25 news stories right now on Brah-mins Television! {first_item['title']}."
+            f"Top 25 news stories right now on Brah-mins Television! Number 1: {first_item['title']}."
         )
         segments.append(
             build_segment_video(
@@ -490,6 +628,8 @@ def main() -> None:
                 spoken_text=hook_spoken,
                 workdir=tmpdir,
                 idx=0,
+                story_num=1,
+                total_stories=total_stories,
             )
         )
 
@@ -497,8 +637,9 @@ def main() -> None:
         for i, item in enumerate(items[1:], start=1):
             if running_sec >= TARGET_MAX_SECONDS - 4.0:
                 break
-            photo = load_story_photo(item["image_url"], base_template)
-            spoken = clean_for_tts(f"{item['title']}. {item['summary']}")
+            story_num = i + 1
+            photo = load_story_photo(item["image_url"], story_num, item["title"])
+            spoken = clean_for_tts(f"Number {story_num}: {item['title']}.")
             seg = build_segment_video(
                 base_template=base_template,
                 photo_rgb=photo,
@@ -506,12 +647,15 @@ def main() -> None:
                 spoken_text=spoken,
                 workdir=tmpdir,
                 idx=i,
+                story_num=story_num,
+                total_stories=total_stories,
             )
             running_sec += probe_duration_seconds(seg)
             segments.append(seg)
 
         concat_segments(segments, output_path, tmpdir)
-        print(f"Built {output_path} ({len(segments)} segments, {probe_duration_seconds(output_path):.1f}s)")
+        final_dur = probe_duration_seconds(output_path)
+        print(f"[SUCCESS] Built {output_path} ({len(segments)} segments, {final_dur:.1f}s)")
 
 
 if __name__ == "__main__":
