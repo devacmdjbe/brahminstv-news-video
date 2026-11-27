@@ -387,7 +387,7 @@ def build_segment_video(
     seg_mp4 = os.path.join(workdir, f"seg_{idx:02d}.mp4")
 
     audio_dur = synthesize_voiceover(spoken_text, audio_path)
-    total_dur = audio_dur + 0.35
+    total_dur = max(2.5, audio_dur + 0.35)
     num_frames = max(12, int(math.ceil(total_dur * FPS)))
 
     px1, py1, px2, py2 = SLOT_PHOTO
@@ -404,18 +404,20 @@ def build_segment_video(
             "-r", str(FPS),
             "-i", "-",
             "-i", audio_path,
+            "-t", f"{total_dur:.2f}",
             "-c:v", "libx264",
             "-preset", "ultrafast",
             "-crf", "23",
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
+            "-ar", "44100",
+            "-ac", "1",
             "-b:a", "128k",
-            "-shortest",
             seg_mp4,
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
 
     assert proc.stdin is not None
@@ -423,11 +425,20 @@ def build_segment_video(
         for f_idx in range(num_frames):
             progress = f_idx / max(1, num_frames - 1)
             proc.stdin.write(render_frame_fast(text_layer, base_photo, progress))
+    except BrokenPipeError:
+        err_out = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+        proc.wait()
+        raise RuntimeError(f"FFmpeg pipe closed early on segment {idx}: {err_out[-600:]}")
     finally:
-        proc.stdin.close()
-        ret = proc.wait()
-        if ret != 0:
-            raise RuntimeError(f"FFmpeg failed on segment {idx} with code {ret}")
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+
+    err_out = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+    if proc.stderr:
+        proc.stderr.close()
+    ret = proc.wait()
+    if ret != 0:
+        raise RuntimeError(f"FFmpeg failed on segment {idx} (code {ret}): {err_out[-600:]}")
 
     return seg_mp4
 
