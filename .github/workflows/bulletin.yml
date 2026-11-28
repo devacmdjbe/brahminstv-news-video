@@ -30,8 +30,7 @@ jobs:
         env:
           STUDIO_TEMPLATE_PATH: assets/studio_template_9x16.png
           OUTPUT_MP4_PATH: top25-latest.mp4
-          ARCHIVE_JSON_URL: ${{ vars.ARCHIVE_JSON_URL }}
-          APPS_SCRIPT_URL: ${{ vars.APPS_SCRIPT_URL }}
+          ARCHIVE_JSON_URL: https://script.google.com/macros/s/AKfycbwmR1L1y9LHcNy4H4UWAbCxrK96KsUyKalwDzj-yoojiTNCuqrjo9Vosbv3jNT9xXCt/exec?view=archive
           BTV_ACCESS_TOKEN: ${{ secrets.BTV_ACCESS_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
