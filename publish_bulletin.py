@@ -59,7 +59,6 @@ def extract_aired_headlines():
                 items = data[key]
                 break
         if not items:
-            # Handle dict keyed by story ID or timestamp
             vals = list(data.values())
             if vals and isinstance(vals[-1], dict) and isinstance(vals[-1].get("stories"), list):
                 items = vals[-1]["stories"]
@@ -312,7 +311,6 @@ def publish_linkedin_video(viral_title, full_caption):
         },
     )
 
-    # Wait briefly for LinkedIn video transcoding before creating post
     for _ in range(18):
         time.sleep(5)
         encoded_urn = urllib.parse.quote(video_urn, safe="")
