@@ -2,6 +2,12 @@ name: Build and Publish Top 25 Bulletin
 
 on:
   workflow_dispatch:
+  schedule:
+    # 7:00 AM, 12:00 PM, 5:00 PM, 10:00 PM IST (UTC+5:30 -> 01:30, 06:30, 11:30, 16:30 UTC)
+    - cron: "30 1 * * *"
+    - cron: "30 6 * * *"
+    - cron: "30 11 * * *"
+    - cron: "30 16 * * *"
 
 permissions:
   contents: write
@@ -50,3 +56,19 @@ jobs:
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish bulletin to Facebook, Instagram & LinkedIn
+        env:
+          OUTPUT_MP4_PATH: top25-latest.mp4
+          USED_JSON_PATH: used_bulletins.json
+          RELEASE_TAG: latest-bulletin
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+          INSTAGRAM_USER_ID: ${{ secrets.INSTAGRAM_USER_ID }}
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }}
+          LINKEDIN_ORG_URN: ${{ secrets.LINKEDIN_ORG_URN }}
+          LINKEDIN_VERSION: ${{ secrets.LINKEDIN_VERSION }}
+        run: |
+          python publish_bulletin.py
