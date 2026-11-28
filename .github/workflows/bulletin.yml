@@ -30,6 +30,11 @@ jobs:
         env:
           STUDIO_TEMPLATE_PATH: assets/studio_template_9x16.png
           OUTPUT_MP4_PATH: top25-latest.mp4
+          ARCHIVE_JSON_URL: ${{ vars.ARCHIVE_JSON_URL }}
+          APPS_SCRIPT_URL: ${{ vars.APPS_SCRIPT_URL }}
+          BTV_ACCESS_TOKEN: ${{ secrets.BTV_ACCESS_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python build_bulletin.py
           ls -lh top25-latest.mp4
@@ -40,7 +45,9 @@ jobs:
           tag_name: latest-bulletin
           name: Latest Top 25 Bulletin
           body: Automated 9:16 Top 25 news bulletin built by Brahmins TV pipeline.
-          files: top25-latest.mp4
+          files: |
+            top25-latest.mp4
+            used_bulletins.json
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
