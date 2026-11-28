@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Brahmins TV - Top 25 News Shots Vertical (9:16) Bulletin Builder
-Targets up to 25 fresh stories between bulletins (non-rigid: airs fewer if
-fewer fresh stories exist), avoids cross-bulletin duplication, rotates across
-5 voices (3 Female + 2 Male) at natural pace, renders at 720x1280 (720p 9:16)
-up to 2m 45s (165s), and encodes at a lean bitrate for consistent streaming.
+Uses edge-tts neural voices for natural news reading, selects up to 25 fresh
+un-aired stories within a 5-hour between-bulletin window (fewer allowed if
+fewer fresh stories exist), renders at 720x1280 (720p 9:16) up to 2m 45s (165s),
+and encodes at a lean bitrate for consistent social media streaming.
 """
 
+import asyncio
 import csv
 import datetime as dt
 import hashlib
@@ -21,19 +22,21 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import edge_tts
 from PIL import Image, ImageDraw, ImageFont
 
 # 720p vertical (9:16): 720x1280
 W, H = 720, 1280
 FPS = 24
-TARGET_MAX_ITEMS = 25          # Soft target; fewer than 25 is allowed when fewer are fresh
+TARGET_MAX_ITEMS = 25          # Non-rigid target: airs fewer if fewer fresh stories exist
 TARGET_MAX_SECONDS = 165       # 2m 45s cap for Shorts / Reels
 DEDUP_LOOKBACK_HOURS = 36
 MAX_STORY_AGE_HOURS = float(os.environ.get("MAX_STORY_AGE_HOURS", "5"))
+SEGMENT_TAIL_PAD_SEC = 0.60    # Clean pause after narration so audio never bleeds across cuts
 
 TEMPLATE_PATH = os.environ.get("STUDIO_TEMPLATE_PATH", "assets/studio_template_9x16.png")
 
-# Scaled proportionally from 1080x1920 template slots
+# Scaled proportionally for 720x1280 template slots
 SLOT_PHOTO: Tuple[int, int, int, int] = (24, 279, 696, 740)
 SLOT_NEWS: Tuple[int, int, int, int] = (29, 848, 691, 1072)
 
@@ -48,13 +51,13 @@ LOCAL_SOURCE_CANDIDATES = [
     "data/archive.csv",
 ]
 
-# 5 distinct voices: 3 Female (F1, F2, F3) + 2 Male (M1, M2) at normal, unhurried pace
+# 5-voice rotation (3 Female + 2 Male) using neural voices at natural news pace
 FIVE_VOICE_ROSTER: List[Dict[str, Any]] = [
-    {"id": "F1", "gender": "F", "espeak": "en-in+f3", "speed": 134, "pitch": 52, "tempo": 0.88, "semitones": 0.8},
-    {"id": "M1", "gender": "M", "espeak": "en-in+m1", "speed": 132, "pitch": 40, "tempo": 0.86, "semitones": -1.0},
-    {"id": "F2", "gender": "F", "espeak": "en-in+f4", "speed": 136, "pitch": 56, "tempo": 0.90, "semitones": 1.2},
-    {"id": "M2", "gender": "M", "espeak": "en-in+m4", "speed": 130, "pitch": 36, "tempo": 0.85, "semitones": -1.4},
-    {"id": "F3", "gender": "F", "espeak": "en-in+f2", "speed": 134, "pitch": 48, "tempo": 0.88, "semitones": 0.4},
+    {"id": "F1", "gender": "F", "voice": "en-IN-NeerjaNeural", "rate": "+0%"},
+    {"id": "M1", "gender": "M", "voice": "en-IN-PrabhatNeural", "rate": "-3%"},
+    {"id": "F2", "gender": "F", "voice": "en-IN-NeerjaExpressiveNeural", "rate": "+2%"},
+    {"id": "M2", "gender": "M", "voice": "en-IN-PrabhatNeural", "rate": "-6%"},
+    {"id": "F3", "gender": "F", "voice": "en-IN-NeerjaNeural", "rate": "-2%"},
 ]
 
 VIRAL_KEYWORDS = [
@@ -127,13 +130,6 @@ def expand_for_tts(text: str) -> str:
         pattern = r"\b" + re.escape(abbr) + r"\b"
         s = re.sub(pattern, expansion, s)
 
-    def _spell_caps(match: re.Match) -> str:
-        token = match.group(0)
-        if token in ("I", "A"):
-            return token
-        return " ".join(list(token))
-
-    s = re.sub(r"\b[A-Z]{2,5}\b", _spell_caps, s)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -171,7 +167,7 @@ def load_previously_used_fingerprints() -> Tuple[Set[str], List[Dict[str, Any]]]
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Accept": "application/vnd.github+json",
-                    "User-Agent": "BrahminsTV-BulletinBuilder/2.4",
+                    "User-Agent": "BrahminsTV-BulletinBuilder/3.0",
                 },
             )
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -180,7 +176,7 @@ def load_previously_used_fingerprints() -> Tuple[Set[str], List[Dict[str, Any]]]
                 if asset.get("name") == "used_bulletins.json" and asset.get("browser_download_url"):
                     areq = urllib.request.Request(
                         asset["browser_download_url"],
-                        headers={"User-Agent": "BrahminsTV-BulletinBuilder/2.4"},
+                        headers={"User-Agent": "BrahminsTV-BulletinBuilder/3.0"},
                     )
                     with urllib.request.urlopen(areq, timeout=8) as aresp:
                         remote_list = json.loads(aresp.read().decode("utf-8"))
@@ -424,8 +420,7 @@ def fetch_fresh_between_bulletins(
 ) -> List[Dict[str, str]]:
     """
     Selects up to target_limit (25) fresh, un-aired stories within MAX_STORY_AGE_HOURS
-    (default 5h between bulletins). Not rigid: if fewer fresh stories exist in the
-    window, returns only those fresh stories rather than forcing stale items.
+    (default 5h between bulletins). Non-rigid: airs fewer if fewer fresh items exist.
     """
     start_h, end_h, slot_label = _resolve_time_window()
     used_set = used_fps or set()
@@ -452,7 +447,7 @@ def fetch_fresh_between_bulletins(
             try:
                 req = urllib.request.Request(
                     feed_url,
-                    headers={"User-Agent": "BrahminsTV-BulletinBuilder/2.4"},
+                    headers={"User-Agent": "BrahminsTV-BulletinBuilder/3.0"},
                 )
                 with urllib.request.urlopen(req, timeout=12) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -674,51 +669,32 @@ def probe_duration_seconds(media_path: str) -> float:
         return 0.0
 
 
-def _shape_normal_voice(in_wav: str, out_wav: str, voice_cfg: Dict[str, Any]) -> None:
-    tempo = float(voice_cfg["tempo"])
-    semitones = float(voice_cfg["semitones"])
-    pitch_factor = 2.0 ** (semitones / 12.0)
-
-    shifted_rate = int(round(44100 * pitch_factor))
-    comp_tempo = tempo / pitch_factor
-    filters = [f"asetrate={shifted_rate}", "aresample=44100"]
-
-    rem = comp_tempo
-    while rem > 2.0:
-        filters.append("atempo=2.0")
-        rem /= 2.0
-    while rem < 0.5:
-        filters.append("atempo=0.5")
-        rem /= 0.5
-    filters.append(f"atempo={rem:.4f}")
-
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", in_wav, "-filter:a", ",".join(filters), "-ar", "44100", "-ac", "1", out_wav],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True,
-    )
+async def _save_edge_tts_async(text: str, voice: str, rate: str, out_mp3: str) -> None:
+    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate)
+    await communicate.save(out_mp3)
 
 
-def synthesize_five_voice_audio(spoken_text: str, out_wav: str, idx: int) -> float:
+def synthesize_neural_voice_audio(spoken_text: str, out_wav: str, idx: int, workdir: str) -> float:
+    """Synthesizes natural neural speech via edge-tts and normalizes to clean mono WAV."""
     voice_cfg = FIVE_VOICE_ROSTER[idx % len(FIVE_VOICE_ROSTER)]
-    raw_wav = out_wav + ".raw.wav"
+    raw_mp3 = os.path.join(workdir, f"seg_{idx:02d}_edge.mp3")
+
+    asyncio.run(
+        _save_edge_tts_async(
+            text=spoken_text,
+            voice=str(voice_cfg["voice"]),
+            rate=str(voice_cfg["rate"]),
+            out_mp3=raw_mp3,
+        )
+    )
 
     subprocess.run(
-        [
-            "espeak-ng",
-            "-v", str(voice_cfg["espeak"]),
-            "-s", str(voice_cfg["speed"]),
-            "-p", str(voice_cfg["pitch"]),
-            "-w", raw_wav,
-            spoken_text,
-        ],
+        ["ffmpeg", "-y", "-i", raw_mp3, "-ar", "44100", "-ac", "1", out_wav],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=True,
     )
 
-    _shape_normal_voice(raw_wav, out_wav, voice_cfg)
     dur = probe_duration_seconds(out_wav)
     if dur <= 0.3:
         raise RuntimeError(f"Failed to synthesize audio for segment {idx} ({voice_cfg['id']})")
@@ -738,8 +714,9 @@ def build_segment_video(
     audio_path = os.path.join(workdir, f"seg_{idx:02d}.wav")
     seg_mp4 = os.path.join(workdir, f"seg_{idx:02d}.mp4")
 
-    audio_dur = synthesize_five_voice_audio(spoken_text, audio_path, idx)
-    total_dur = max(2.6, audio_dur + 0.30)
+    audio_dur = synthesize_neural_voice_audio(spoken_text, audio_path, idx, workdir)
+    # Keep visual duration slightly longer than audio + tail pad so audio ends cleanly before cut
+    total_dur = max(2.8, audio_dur + SEGMENT_TAIL_PAD_SEC + 0.15)
     num_frames = max(24, int(math.ceil(total_dur * FPS)))
 
     px1, py1, px2, py2 = SLOT_PHOTO
@@ -844,7 +821,7 @@ def main() -> None:
         first_item = items[0]
         first_photo = load_story_photo(first_item["image_url"], 1)
         hook_spoken = expand_for_tts(
-            f"Top news stories right now on Brahmins Television! {first_item['title']}."
+            f"Top news stories right now on Brahmins Television. {first_item['title']}."
         )
         segments.append(
             build_segment_video(
