@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Brahmins TV - Top 25 News Shots Vertical (9:16) Bulletin Builder
-Uses edge-tts neural voices for natural news reading, selects up to 25 fresh
-un-aired stories within a 5-hour between-bulletin window (fewer allowed if
-fewer fresh stories exist), renders at 720x1280 (720p 9:16) up to 2m 45s (165s),
-and encodes at a lean bitrate for consistent social media streaming.
+Uses edge-tts neural voices for natural news reading, expands HC/SC to
+High Court / Supreme Court, converts 'zh' to 'l' for clean pronunciation of 'ழ',
+formats other acronyms cleanly, filters out non-news evergreen essays,
+enforces frame-accurate audio/video sync with zero drift, and renders at
+720x1280 (720p 9:16) strictly within 2m 45s (165s).
 """
 
 import asyncio
@@ -29,10 +30,10 @@ from PIL import Image, ImageDraw, ImageFont
 W, H = 720, 1280
 FPS = 24
 TARGET_MAX_ITEMS = 25          # Non-rigid target: airs fewer if fewer fresh stories exist
-TARGET_MAX_SECONDS = 165       # 2m 45s cap for Shorts / Reels
+TARGET_MAX_SECONDS = 165.0     # Strict 2m 45s cap for Shorts / Reels
 DEDUP_LOOKBACK_HOURS = 36
 MAX_STORY_AGE_HOURS = float(os.environ.get("MAX_STORY_AGE_HOURS", "5"))
-SEGMENT_TAIL_PAD_SEC = 0.60    # Clean pause after narration so audio never bleeds across cuts
+SEGMENT_TAIL_PAD_SEC = 0.65    # Exact silence appended to each WAV so audio never bleeds across cuts
 
 TEMPLATE_PATH = os.environ.get("STUDIO_TEMPLATE_PATH", "assets/studio_template_9x16.png")
 
@@ -66,32 +67,38 @@ VIRAL_KEYWORDS = [
     "ban", "verdict", "resigns", "sacked", "live", "urgent", "blast", "flood",
 ]
 
-ABBREVIATION_MAP: Dict[str, str] = {
-    "TV": "Television",
+# Non-news evergreen essay patterns to exclude unless a real news action word is present
+EVERGREEN_TITLE_PATTERNS = [
+    r"^the\s+evolution\s+of\b",
+    r"^a\s+brief\s+history\s+of\b",
+    r"^how\s+to\b",
+    r"^why\s+.*\s+matters\b",
+    r"^understanding\s+the\b",
+    r"^explainer:\s*",
+    r"\bculture\s+among\s+indian\s+youths?\b",
+]
+
+NEWS_ACTION_GUARD_WORDS = {
+    "arrest", "arrested", "probe", "ban", "banned", "court", "verdict", "order",
+    "bill", "parliament", "minister", "police", "crash", "fire", "killed", "dead",
+    "injured", "launch", "launched", "announces", "announced", "strike", "protest",
+    "summons", "raid", "seized", "rbi", "sebi", "cabinet", "election", "alert",
+}
+
+# Explicit full-word expansions for court shortforms so they read clearly
+EXPLICIT_WORD_EXPANSIONS: Dict[str, str] = {
     "HC": "High Court",
     "SC": "Supreme Court",
-    "CBI": "Central Bureau of Investigation",
-    "ED": "Enforcement Directorate",
-    "SBI": "State Bank of India",
-    "RBI": "Reserve Bank of India",
-    "AP": "Andhra Pradesh",
-    "TN": "Tamil Nadu",
-    "TS": "Telangana",
-    "UP": "Uttar Pradesh",
-    "MP": "Madhya Pradesh",
-    "BJP": "Bharatiya Janata Party",
-    "INC": "Congress",
-    "DMK": "Dravida Munnetra Kazhagam",
-    "AIADMK": "All India Anna Dravida Munnetra Kazhagam",
-    "PM": "Prime Minister",
-    "CM": "Chief Minister",
-    "MLA": "Member of Legislative Assembly",
-    "MPs": "Members of Parliament",
-    "FIR": "First Information Report",
-    "CCTV": "closed circuit camera",
-    "AI": "Artificial Intelligence",
-    "IST": "Indian Standard Time",
     "M/s": "Messers",
+}
+
+# Acronyms that edge-tts reads naturally as words without spacing
+PRONOUNCEABLE_ACRONYMS: Set[str] = {
+    "ISRO", "NASA", "NATO", "AIIMS", "COVID", "NEET", "UPSC", "SEBI", "TRAI",
+    "UIDAI", "NITI", "AYUSH", "FEMA", "PMLA", "UAPA", "POCSO", "MGNREGA",
+    "BRICS", "QUAD", "ASEAN", "OPEC", "FIFA", "UEFA", "BCCI", "IPL", "WPL",
+    "ICMR", "DRDO", "HAL", "BHEL", "ONGC", "NTPC", "GAIL", "IRCTC", "NDMA",
+    "IMD", "NDRF", "SDRF", "CRPF", "BSF", "CISF", "NSG", "IAF", "INS",
 }
 
 FONT_CANDIDATES = [
@@ -121,16 +128,70 @@ def clean_display_text(text: Any) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _replace_zh_with_l(text: str) -> str:
+    """Replaces Romanized 'zh' ('ழ') with 'l' (preserving case) for clean neural TTS."""
+    def _sub(match: re.Match) -> str:
+        tok = match.group(0)
+        if tok.isupper():
+            return "L"
+        if tok[0].isupper():
+            return "L"
+        return "l"
+
+    return re.sub(r"zh", _sub, text, flags=re.IGNORECASE)
+
+
 def expand_for_tts(text: str) -> str:
+    """
+    Formats text for crisp neural speech:
+    - Guides 'Brahmins' so it is never read as 'Brahmans'
+    - Expands HC -> High Court and SC -> Supreme Court
+    - Converts 'zh' ('ழ') -> 'l' (e.g., Kazhagam -> Kalagam)
+    - Leaves pronounceable acronyms (ISRO, AIIMS, NEET, etc.) intact as words
+    - Spaces letter-by-letter acronyms (DMK -> D M K, AIADMK -> A I A D M K, BJP -> B J P, etc.)
+    """
     s = clean_display_text(text)
-    s = re.sub(r"\bBrahmans?\b", "Brahmins", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bBrahmins\s+TV\b", "Brahmins Television", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bBrahmans?\b", "Braahmins", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bBrahmins\b", "Braahmins", s, flags=re.IGNORECASE)
 
-    for abbr, expansion in ABBREVIATION_MAP.items():
-        pattern = r"\b" + re.escape(abbr) + r"\b"
-        s = re.sub(pattern, expansion, s)
+    # Expand HC and SC before acronym spacing
+    for abbr, full_form in EXPLICIT_WORD_EXPANSIONS.items():
+        s = re.sub(r"\b" + re.escape(abbr) + r"\b", full_form, s)
 
+    # Compensate Tamil/Malayalam 'zh' ('ழ') with 'l'
+    s = _replace_zh_with_l(s)
+
+    # Handle plural acronyms like MPs -> M Ps, MLAs -> M L As, FIRs -> F I Rs
+    def _format_plural_acronym(match: re.Match) -> str:
+        base = match.group(1)
+        if base in PRONOUNCEABLE_ACRONYMS:
+            return base + "s"
+        return " ".join(list(base)) + "s"
+
+    s = re.sub(r"\b([A-Z]{2,6})s\b", _format_plural_acronym, s)
+
+    # Handle uppercase shortforms (2 to 6 letters)
+    def _format_acronym(match: re.Match) -> str:
+        token = match.group(0)
+        if token in ("I", "A"):
+            return token
+        if token in PRONOUNCEABLE_ACRONYMS:
+            return token
+        return " ".join(list(token))
+
+    s = re.sub(r"\b[A-Z]{2,6}\b", _format_acronym, s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+def _is_evergreen_filler(title: str) -> bool:
+    low = clean_display_text(title).lower()
+    words = set(re.findall(r"[a-z]+", low))
+    if words & NEWS_ACTION_GUARD_WORDS:
+        return False
+    for pat in EVERGREEN_TITLE_PATTERNS:
+        if re.search(pat, low):
+            return True
+    return False
 
 
 def _get_ist_now() -> dt.datetime:
@@ -167,7 +228,7 @@ def load_previously_used_fingerprints() -> Tuple[Set[str], List[Dict[str, Any]]]
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Accept": "application/vnd.github+json",
-                    "User-Agent": "BrahminsTV-BulletinBuilder/3.0",
+                    "User-Agent": "BrahminsTV-BulletinBuilder/3.2",
                 },
             )
             with urllib.request.urlopen(req, timeout=8) as resp:
@@ -176,7 +237,7 @@ def load_previously_used_fingerprints() -> Tuple[Set[str], List[Dict[str, Any]]]
                 if asset.get("name") == "used_bulletins.json" and asset.get("browser_download_url"):
                     areq = urllib.request.Request(
                         asset["browser_download_url"],
-                        headers={"User-Agent": "BrahminsTV-BulletinBuilder/3.0"},
+                        headers={"User-Agent": "BrahminsTV-BulletinBuilder/3.2"},
                     )
                     with urllib.request.urlopen(areq, timeout=8) as aresp:
                         remote_list = json.loads(aresp.read().decode("utf-8"))
@@ -357,6 +418,10 @@ def _normalize_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not title or len(title) < 8:
         return None
 
+    if _is_evergreen_filler(title):
+        print(f"[SKIP] Filtered non-news evergreen item: {title}")
+        return None
+
     summary = clean_display_text(
         row.get("summary")
         or row.get("description")
@@ -418,10 +483,6 @@ def fetch_fresh_between_bulletins(
     target_limit: int = TARGET_MAX_ITEMS,
     used_fps: Optional[Set[str]] = None,
 ) -> List[Dict[str, str]]:
-    """
-    Selects up to target_limit (25) fresh, un-aired stories within MAX_STORY_AGE_HOURS
-    (default 5h between bulletins). Non-rigid: airs fewer if fewer fresh items exist.
-    """
     start_h, end_h, slot_label = _resolve_time_window()
     used_set = used_fps or set()
     raw_rows: List[Dict[str, Any]] = []
@@ -447,7 +508,7 @@ def fetch_fresh_between_bulletins(
             try:
                 req = urllib.request.Request(
                     feed_url,
-                    headers={"User-Agent": "BrahminsTV-BulletinBuilder/3.0"},
+                    headers={"User-Agent": "BrahminsTV-BulletinBuilder/3.2"},
                 )
                 with urllib.request.urlopen(req, timeout=12) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
@@ -480,7 +541,7 @@ def fetch_fresh_between_bulletins(
     print(
         f"[INFO] Source: {source_used or 'NONE'} | Raw: {len(raw_rows)} | "
         f"MaxAge: {MAX_STORY_AGE_HOURS}h | Fresh unseen in window: {len(fresh_unseen)} | "
-        f"Window: {slot_label} | Airing: {len(selected)} (target up to {target_limit})"
+        f"Window: {slot_label} | Candidates: {len(selected)}"
     )
     return [{"title": it["title"], "summary": it["summary"], "image_url": it["image_url"]} for it in selected]
 
@@ -674,10 +735,20 @@ async def _save_edge_tts_async(text: str, voice: str, rate: str, out_mp3: str) -
     await communicate.save(out_mp3)
 
 
-def synthesize_neural_voice_audio(spoken_text: str, out_wav: str, idx: int, workdir: str) -> float:
-    """Synthesizes natural neural speech via edge-tts and normalizes to clean mono WAV."""
+def synthesize_padded_segment_wav(
+    spoken_text: str,
+    out_wav: str,
+    idx: int,
+    workdir: str,
+) -> Tuple[float, int]:
+    """
+    Synthesizes natural neural speech via edge-tts, appends exact silence padding
+    (SEGMENT_TAIL_PAD_SEC), and snaps total segment duration to an exact integer
+    multiple of FPS frames so audio and visual cuts never drift out of sync.
+    """
     voice_cfg = FIVE_VOICE_ROSTER[idx % len(FIVE_VOICE_ROSTER)]
     raw_mp3 = os.path.join(workdir, f"seg_{idx:02d}_edge.mp3")
+    raw_wav = os.path.join(workdir, f"seg_{idx:02d}_raw.wav")
 
     asyncio.run(
         _save_edge_tts_async(
@@ -689,35 +760,48 @@ def synthesize_neural_voice_audio(spoken_text: str, out_wav: str, idx: int, work
     )
 
     subprocess.run(
-        ["ffmpeg", "-y", "-i", raw_mp3, "-ar", "44100", "-ac", "1", out_wav],
+        ["ffmpeg", "-y", "-i", raw_mp3, "-ar", "44100", "-ac", "1", raw_wav],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=True,
     )
 
-    dur = probe_duration_seconds(out_wav)
-    if dur <= 0.3:
+    speech_dur = probe_duration_seconds(raw_wav)
+    if speech_dur <= 0.3:
         raise RuntimeError(f"Failed to synthesize audio for segment {idx} ({voice_cfg['id']})")
-    return dur
+
+    target_dur = max(3.0, speech_dur + SEGMENT_TAIL_PAD_SEC)
+    num_frames = int(math.ceil(target_dur * FPS))
+    exact_dur = num_frames / float(FPS)
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", raw_wav,
+            "-af", f"apad=whole_dur={exact_dur:.6f}",
+            "-ar", "44100",
+            "-ac", "1",
+            out_wav,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
+
+    return exact_dur, num_frames
 
 
-def build_segment_video(
+def render_segment_video_only(
     base_template: Image.Image,
     photo_rgb: Image.Image,
     headline: str,
-    spoken_text: str,
+    num_frames: int,
     workdir: str,
     idx: int,
     story_num: int,
     total_stories: int,
 ) -> str:
-    audio_path = os.path.join(workdir, f"seg_{idx:02d}.wav")
-    seg_mp4 = os.path.join(workdir, f"seg_{idx:02d}.mp4")
-
-    audio_dur = synthesize_neural_voice_audio(spoken_text, audio_path, idx, workdir)
-    # Keep visual duration slightly longer than audio + tail pad so audio ends cleanly before cut
-    total_dur = max(2.8, audio_dur + SEGMENT_TAIL_PAD_SEC + 0.15)
-    num_frames = max(24, int(math.ceil(total_dur * FPS)))
+    seg_mp4 = os.path.join(workdir, f"seg_{idx:02d}_vid.mp4")
 
     px1, py1, px2, py2 = SLOT_PHOTO
     base_photo = fit_cover(photo_rgb, px2 - px1, py2 - py1)
@@ -733,8 +817,7 @@ def build_segment_video(
             "-pix_fmt", "rgb24",
             "-r", str(FPS),
             "-i", "-",
-            "-i", audio_path,
-            "-t", f"{total_dur:.2f}",
+            "-frames:v", str(num_frames),
             "-c:v", "libx264",
             "-preset", "medium",
             "-crf", "26",
@@ -742,10 +825,6 @@ def build_segment_video(
             "-maxrate", "1400k",
             "-bufsize", "2200k",
             "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-ar", "44100",
-            "-ac", "1",
-            "-b:a", "96k",
             seg_mp4,
         ],
         stdin=subprocess.PIPE,
@@ -776,19 +855,50 @@ def build_segment_video(
     return seg_mp4
 
 
-def concat_segments(segment_paths: List[str], out_mp4: str, workdir: str) -> None:
-    list_file = os.path.join(workdir, "concat_list.txt")
-    with open(list_file, "w", encoding="utf-8") as f:
-        for p in segment_paths:
-            f.write(f"file '{p}'\n")
+def assemble_master_bulletin(
+    video_segments: List[str],
+    wav_segments: List[str],
+    out_mp4: str,
+    workdir: str,
+) -> None:
+    vid_list = os.path.join(workdir, "vid_concat.txt")
+    with open(vid_list, "w", encoding="utf-8") as f:
+        for vp in video_segments:
+            f.write(f"file '{vp}'\n")
+
+    wav_list = os.path.join(workdir, "wav_concat.txt")
+    with open(wav_list, "w", encoding="utf-8") as f:
+        for wp in wav_segments:
+            f.write(f"file '{wp}'\n")
+
+    full_wav = os.path.join(workdir, "full_narration.wav")
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", wav_list,
+            "-c", "copy",
+            full_wav,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+    )
 
     subprocess.run(
         [
             "ffmpeg", "-y",
             "-f", "concat",
             "-safe", "0",
-            "-i", list_file,
-            "-c", "copy",
+            "-i", vid_list,
+            "-i", full_wav,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-ar", "44100",
+            "-ac", "1",
+            "-b:a", "96k",
+            "-shortest",
             "-movflags", "+faststart",
             out_mp4,
         ],
@@ -804,65 +914,74 @@ def main() -> None:
 
     base_template = Image.open(TEMPLATE_PATH).convert("RGBA").resize((W, H), Image.Resampling.LANCZOS)
     used_fps, prior_entries = load_previously_used_fingerprints()
-    items = fetch_fresh_between_bulletins(target_limit=TARGET_MAX_ITEMS, used_fps=used_fps)
+    candidates = fetch_fresh_between_bulletins(target_limit=TARGET_MAX_ITEMS, used_fps=used_fps)
 
-    if not items:
+    if not candidates:
         raise RuntimeError(
             f"No fresh un-aired news items found within {MAX_STORY_AGE_HOURS}h window."
         )
 
-    total_stories = len(items)
     output_path = os.environ.get("OUTPUT_MP4_PATH", "top25-latest.mp4")
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        segments: List[str] = []
-        aired_in_this_run: List[Dict[str, str]] = []
+        planned_segments: List[Dict[str, Any]] = []
+        running_sec = 0.0
 
-        first_item = items[0]
-        first_photo = load_story_photo(first_item["image_url"], 1)
-        hook_spoken = expand_for_tts(
-            f"Top news stories right now on Brahmins Television. {first_item['title']}."
-        )
-        segments.append(
-            build_segment_video(
-                base_template=base_template,
-                photo_rgb=first_photo,
-                headline=first_item["title"],
-                spoken_text=hook_spoken,
-                workdir=tmpdir,
-                idx=0,
-                story_num=1,
-                total_stories=total_stories,
-            )
-        )
-        aired_in_this_run.append(first_item)
+        for idx, item in enumerate(candidates):
+            if idx == 0:
+                spoken = expand_for_tts(
+                    f"Top news stories right now on Brahmins TV. {item['title']}."
+                )
+            else:
+                spoken = expand_for_tts(f"{item['title']}.")
 
-        running_sec = probe_duration_seconds(segments[0])
-        for i, item in enumerate(items[1:], start=1):
-            if running_sec >= TARGET_MAX_SECONDS - 4.0:
+            wav_path = os.path.join(tmpdir, f"seg_{idx:02d}.wav")
+            exact_dur, num_frames = synthesize_padded_segment_wav(spoken, wav_path, idx, tmpdir)
+
+            if idx > 0 and (running_sec + exact_dur) > TARGET_MAX_SECONDS:
                 break
-            story_num = i + 1
+
+            running_sec += exact_dur
+            planned_segments.append(
+                {
+                    "idx": idx,
+                    "item": item,
+                    "wav_path": wav_path,
+                    "exact_dur": exact_dur,
+                    "num_frames": num_frames,
+                }
+            )
+
+        total_aired = len(planned_segments)
+        print(f"[INFO] Locked {total_aired} stories for exact runtime {running_sec:.2f}s (<= {TARGET_MAX_SECONDS:.0f}s)")
+
+        video_segments: List[str] = []
+        wav_segments: List[str] = []
+        aired_items: List[Dict[str, str]] = []
+
+        for pos, seg_info in enumerate(planned_segments):
+            story_num = pos + 1
+            item = seg_info["item"]
             photo = load_story_photo(item["image_url"], story_num)
-            spoken = expand_for_tts(f"{item['title']}.")
-            seg = build_segment_video(
+            vid_path = render_segment_video_only(
                 base_template=base_template,
                 photo_rgb=photo,
                 headline=item["title"],
-                spoken_text=spoken,
+                num_frames=seg_info["num_frames"],
                 workdir=tmpdir,
-                idx=i,
+                idx=seg_info["idx"],
                 story_num=story_num,
-                total_stories=total_stories,
+                total_stories=total_aired,
             )
-            running_sec += probe_duration_seconds(seg)
-            segments.append(seg)
-            aired_in_this_run.append(item)
+            video_segments.append(vid_path)
+            wav_segments.append(seg_info["wav_path"])
+            aired_items.append(item)
 
-        concat_segments(segments, output_path, tmpdir)
-        save_used_fingerprints(aired_in_this_run, prior_entries)
+        assemble_master_bulletin(video_segments, wav_segments, output_path, tmpdir)
+        save_used_fingerprints(aired_items, prior_entries)
         final_dur = probe_duration_seconds(output_path)
         size_mb = os.path.getsize(output_path) / (1024 * 1024) if os.path.exists(output_path) else 0.0
-        print(f"[SUCCESS] Built {output_path} ({len(segments)}/{total_stories} stories, {final_dur:.1f}s, {size_mb:.1f} MB)")
+        print(f"[SUCCESS] Built {output_path} ({total_aired} stories, {final_dur:.2f}s, {size_mb:.1f} MB)")
 
 
 if __name__ == "__main__":
