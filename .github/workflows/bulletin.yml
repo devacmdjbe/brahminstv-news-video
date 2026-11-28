@@ -19,12 +19,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install FFmpeg, TTS, fonts, and Python packages
+      - name: Install FFmpeg, fonts, and Python packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg espeak-ng fonts-dejavu-core fonts-liberation
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-liberation
           python -m pip install --upgrade pip
-          pip install pillow gTTS
+          pip install pillow edge-tts
 
       - name: Build 9:16 Top 25 news bulletin
         env:
